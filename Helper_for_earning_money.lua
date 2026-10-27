@@ -271,7 +271,7 @@ local function notify(text, color)
 end
 
 -- ============================================================
---  UPDATER - замени YOUR_NICK и YOUR_REPO на свои
+--  UPDATER
 -- ============================================================
 local SCRIPT_FILENAME = 'Helper_for_earning_money.lua'
 local LOCAL_VERSION   = '28.0.8'
@@ -283,12 +283,22 @@ local updateAvailable   = false
 local updateDownloading = false
 local remoteVersion     = ''
 
+-- MoonLoader (PC) умеет downloadUrlToFile, MonetLoader (Android) - только socket/ssl.
 local okMoon, moonlib = pcall(require, 'moonloader')
-local DS_END = 4
+local DS_END = 6
 if okMoon and moonlib and moonlib.download_status then
     DS_END = moonlib.download_status.STATUS_ENDDOWNLOADDATA
 end
-local canDownload = (downloadUrlToFile ~= nil)
+
+local okHttp,  http  = pcall(require, 'socket.http')
+if not okHttp then http = nil end
+
+local okHttps, https = pcall(require, 'ssl.https')
+if not okHttps then https = nil end
+
+local hasRawDownload = (downloadUrlToFile ~= nil)
+local hasHttpFetch   = (http ~= nil)
+local canDownload    = hasRawDownload or hasHttpFetch
 
 local function parseVer(s)
     local a, b, c = tostring(s):match('(%d+)%.(%d+)%.(%d+)')
@@ -296,68 +306,99 @@ local function parseVer(s)
     return tonumber(a) * 1000000 + tonumber(b) * 1000 + tonumber(c)
 end
 
-local function readRemoteVersion()
-    local f = io.open(WORK_DIR .. '/update_version.txt', 'r')
+local function readFile(path)
+    local f = io.open(path, 'r')
     if not f then return nil end
-    local content = f:read('*a') or ''
+    local content = f:read('*a')
     f:close()
-    return (content:match('^%s*(.-)%s*$'))
+    return content
 end
 
-local function applyVersionFile()
-    local ver = readRemoteVersion()
+local function writeFile(path, content)
+    local f = io.open(path, 'wb')
+    if not f then return false end
+    f:write(content)
+    f:close()
+    return true
+end
+
+-- Загрузка через socket.http / ssl.https (MonetLoader)
+local function socketFetch(url)
+    local body = {}
+    local sink = function(chunk)
+        if chunk then body[#body + 1] = chunk end
+        return 1
+    end
+    local opts = { url = url, sink = sink, method = 'GET', redirect = true }
+
+    local isHttps = url:match('^https') ~= nil
+    local lib = isHttps and https or http
+    if not lib then
+        return nil, isHttps and 'нет ssl.https' or 'нет socket.http'
+    end
+
+    local ok, res1, res2 = pcall(lib.request, opts)
+    if not ok then return nil, tostring(res1) end
+    if res1 ~= 1 then return nil, tostring(res2 or res1 or 'request failed') end
+    if res2 ~= 200 then return nil, 'HTTP ' .. tostring(res2) end
+    local text = table.concat(body)
+    if text == '' then return nil, 'пустой ответ' end
+    return text
+end
+
+-- Загрузка через downloadUrlToFile (PC MoonLoader)
+local function rawFetch(url)
+    local tmp = WORK_DIR .. '/update_tmp_version.txt'
+    os.remove(tmp)
+
+    local finished = false
+    local ok = pcall(downloadUrlToFile, url, tmp, function(id, status)
+        if status == DS_END then finished = true end
+    end)
+    if not ok then return nil, 'downloadUrlToFile' end
+
+    local t0 = os.clock()
+    while not finished and (os.clock() - t0) < 15 do wait(0) end
+
+    local content = readFile(tmp)
+    os.remove(tmp)
+    if not content or content == '' then return nil, 'пустой ответ' end
+    return content
+end
+
+local function fetchText(url)
+    if hasRawDownload then
+        local body, err = rawFetch(url)
+        if body then return body end
+    end
+    if hasHttpFetch then
+        return socketFetch(url)
+    end
+    return nil, 'нет транспорта'
+end
+
+local function applyVersionText(text)
+    local ver = tostring(text or ''):match('%d+%.%d+%.%d+')
     if not ver then return 'err' end
     local r, l = parseVer(ver), parseVer(LOCAL_VERSION)
-    if r and l and r > l then
+    if not r or not l then return 'err' end
+    if r > l then
         remoteVersion = ver
         updateAvailable = true
         return 'new'
     end
+    remoteVersion = ver
+    updateAvailable = false
     return 'same'
 end
 
-local function versionCheckHandler(id, status, p1, p2)
-    if status == DS_END then
-        lua_thread.create(function()
-            wait(200)
-            updateDownloading = false
-            local st = applyVersionFile()
-            if st == 'new' then
-                notify(L'Доступна новая версия: ' .. remoteVersion .. L' | /update', 0xFFAA00)
-                logAct('Update available: ' .. remoteVersion)
-            elseif st == 'same' then
-                notify(L'У вас последняя версия', 0x00FF00)
-            else
-                notify(L'Не удалось проверить обновление', 0xFF0000)
-            end
-        end)
+local function scriptPath()
+    local ok, info = pcall(thisScript)
+    if ok and info then
+        local okPath, path = pcall(function() return info.path end)
+        if okPath and type(path) == 'string' and path ~= '' then return path end
     end
-end
-
-local function scriptDownloadHandler(id, status, p1, p2)
-    if status == DS_END then
-        lua_thread.create(function()
-            wait(200)
-            updateDownloading = false
-            local tmp  = WORK_DIR .. '/update_tmp.tmp'
-            local dest = WORK_DIR .. '/' .. SCRIPT_FILENAME
-            local f = io.open(tmp, 'rb')
-            local ok = false
-            if f then
-                ok = f:seek('end') > 0
-                f:close()
-            end
-            if not ok then
-                notify(L'Ошибка скачивания обновления', 0xFF0000)
-                return
-            end
-            os.remove(dest)
-            os.rename(tmp, dest)
-            updateAvailable = false
-            logAct('Update installed: ' .. tostring(remoteVersion))
-            notify(L'Обновление скачано. Перезапустите игру.', 0x00FF00)
-        end)
-    end
+    return WORK_DIR .. '/' .. SCRIPT_FILENAME
 end
 
 local function doCheck()
@@ -368,11 +409,27 @@ local function doCheck()
     if updateDownloading then return end
     updateDownloading = true
     notify(L'Проверяю обновление...', 0xFFFF00)
-    local ok = pcall(downloadUrlToFile, UPDATE_URL_VERSION, WORK_DIR .. '/update_version.txt', versionCheckHandler)
-    if not ok then
+
+    lua_thread.create(function()
+        local body, err = fetchText(UPDATE_URL_VERSION)
         updateDownloading = false
-        notify(L'Не удалось проверить обновление', 0xFF0000)
-    end
+
+        if not body then
+            logAct('Check failed: ' .. tostring(err))
+            notify(L'Не удалось проверить обновление', 0xFF0000)
+            return
+        end
+
+        local st = applyVersionText(body)
+        if st == 'new' then
+            notify(L'Доступна новая версия: ' .. remoteVersion, 0xFFAA00)
+            logAct('Update available: ' .. remoteVersion)
+        elseif st == 'same' then
+            notify(L'У вас последняя версия', 0x00FF00)
+        else
+            notify(L'Не удалось проверить обновление', 0xFF0000)
+        end
+    end)
 end
 
 local function doUpdate()
@@ -387,11 +444,66 @@ local function doUpdate()
     if updateDownloading then return end
     updateDownloading = true
     notify(L'Идет скачивание обновления...', 0xFFFF00)
-    local ok = pcall(downloadUrlToFile, UPDATE_URL_SCRIPT, WORK_DIR .. '/update_tmp.tmp', scriptDownloadHandler)
-    if not ok then
+
+    lua_thread.create(function()
+        local body, err = fetchText(UPDATE_URL_SCRIPT)
         updateDownloading = false
-        notify(L'Ошибка скачивания обновления', 0xFF0000)
-    end
+
+        if not body or body == '' then
+            logAct('Download failed: ' .. tostring(err))
+            notify(L'Ошибка скачивания обновления', 0xFF0000)
+            return
+        end
+
+        -- защита от «обновления» на страницу-ошибку вместо скрипта
+        if not body:find('script_name', 1, true) then
+            logAct('Download failed: not a script')
+            notify(L'Ошибка скачивания обновления', 0xFF0000)
+            return
+        end
+
+        local tmp = WORK_DIR .. '/update_tmp.tmp'
+        if not writeFile(tmp, body) then
+            notify(L'Ошибка записи обновления', 0xFF0000)
+            return
+        end
+
+        local dest = scriptPath()
+        local backup = dest .. '.bak'
+
+        -- сначала бэкап: если подмена не удастся, скрипт останется рабочим
+        os.remove(backup)
+        if not os.rename(dest, backup) then
+            -- файл только для чтения (частая ситуация на Android)
+            os.remove(tmp)
+            logAct('Rename failed: dest is read-only')
+            notify(L'Нет доступа к файлу скрипта', 0xFF0000)
+            return
+        end
+
+        if not os.rename(tmp, dest) then
+            os.rename(backup, dest)
+            os.remove(tmp)
+            logAct('Rename failed, backup restored')
+            notify(L'Ошибка установки обновления', 0xFF0000)
+            return
+        end
+
+        os.remove(backup)
+        updateAvailable = false
+        logAct('Update installed: ' .. tostring(remoteVersion))
+        notify(L'Обновление скачано. Перезапустите игру.', 0x00FF00)
+
+        -- если загрузчик умеет перезагружать скрипт - делаем это сами
+        wait(800)
+        local okInfo, info = pcall(thisScript)
+        if okInfo and info then
+            local okReload = pcall(function() info:reload() end)
+            if okReload then
+                logAct('Script reloaded')
+            end
+        end
+    end)
 end
 
 local function startUpdateCheck()
@@ -1216,6 +1328,10 @@ local function OrdersTabFrame()
             finishOrder('manual')
         end
         imgui.Spacing()
+        if updateDownloading then
+            imgui.TextColored(imgui.ImVec4(1, 0.7, 0.2, 1), u8(L'Идёт проверка/скачивание...'))
+            imgui.Spacing()
+        end
         if updateAvailable then
             if imgui.Button(u8(L'Обновить до ') .. u8(remoteVersion), imgui.ImVec2(-1, 30)) then
                 doUpdate()
@@ -1225,6 +1341,11 @@ local function OrdersTabFrame()
                 doCheck()
             end
         end
+        imgui.Spacing()
+        if FONT_SUB then imgui.PushFont(FONT_SUB) end
+        imgui.TextColored(imgui.ImVec4(0.55, 0.62, 0.70, 1),
+            u8(L'Версия: ') .. LOCAL_VERSION)
+        if FONT_SUB then imgui.PopFont() end
     end)
 end
 
