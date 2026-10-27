@@ -323,27 +323,58 @@ local function writeFile(path, content)
 end
 
 -- Загрузка через socket.http / ssl.https (MonetLoader)
-local function socketFetch(url)
+-- ВАЖНО: ssl.https (LuaSec) не принимает поле redirect и сам редиректы не умеет,
+-- поэтому redirect не передаём, а 3xx обрабатываем вручную.
+local function socketRequestOnce(url)
     local body = {}
     local sink = function(chunk)
         if chunk then body[#body + 1] = chunk end
         return 1
     end
-    local opts = { url = url, sink = sink, method = 'GET', redirect = true }
 
     local isHttps = url:match('^https') ~= nil
     local lib = isHttps and https or http
     if not lib then
-        return nil, isHttps and 'нет ssl.https' or 'нет socket.http'
+        return nil, nil, isHttps and 'нет ssl.https' or 'нет socket.http'
     end
 
-    local ok, res1, res2 = pcall(lib.request, opts)
-    if not ok then return nil, tostring(res1) end
-    if res1 ~= 1 then return nil, tostring(res2 or res1 or 'request failed') end
-    if res2 ~= 200 then return nil, 'HTTP ' .. tostring(res2) end
-    local text = table.concat(body)
-    if text == '' then return nil, 'пустой ответ' end
-    return text
+    local opts = { url = url, sink = sink, method = 'GET' }
+    local ok, res, code, headers = pcall(lib.request, opts)
+
+    if not ok then return nil, nil, tostring(res) end
+    if res ~= 1 then return nil, nil, tostring(code or res or 'request failed') end
+
+    if code == 200 then
+        return table.concat(body), 200
+    end
+
+    local location = type(headers) == 'table' and headers.location or nil
+    return nil, code, nil, location
+end
+
+local function socketFetch(url)
+    local current = url
+
+    for attempt = 1, 4 do
+        local text, code, err, location = socketRequestOnce(current)
+
+        if text then
+            if text == '' then return nil, 'пустой ответ' end
+            return text
+        end
+
+        if location and (code == 301 or code == 302 or code == 303 or code == 307) then
+            if location:sub(1, 1) == '/' then
+                local schemeHost = current:match('^(https?://[^/]+)')
+                location = schemeHost and (schemeHost .. location) or location
+            end
+            current = location
+        else
+            return nil, err or ('HTTP ' .. tostring(code))
+        end
+    end
+
+    return nil, 'слишком много редиректов'
 end
 
 -- Загрузка через downloadUrlToFile (PC MoonLoader)
