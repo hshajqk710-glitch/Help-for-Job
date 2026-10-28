@@ -1,10 +1,10 @@
 -- Help_for_Job.lua
 -- MonetLoader 3.8.x / MoonLoader
--- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам
--- v29.0.1
+-- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам + исправление автообновления
+-- v29.0.2
 
 script_name('HfJ')
-script_version('29.0.1')
+script_version('29.0.2')
 
 local imgui    = require 'mimgui'
 local new      = imgui.new
@@ -13,7 +13,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local sampev = require 'samp.events'
 
-local VERSION       = '29.0.1'
+local VERSION       = '29.0.2'
 local LOCAL_VERSION = VERSION
 
 -- ============================================================
@@ -346,7 +346,7 @@ end
 -- ============================================================
 -- Имя файла ИМЕННО В РЕПОЗИТОРИИ (локально файл может называться иначе)
 local SCRIPT_FILENAME = 'Help_for_Job.lua'
-local GH_USER, GH_REPO, GH_BRANCH = 'hshajqk710-glitch', 'taxord', 'main'
+local GH_USER, GH_REPO, GH_BRANCH = 'hshajqk710-glitch', 'Help-for-Job', 'main'
 
 local UPDATE_URL_VERSION = ('https://raw.githubusercontent.com/%s/%s/%s/version.txt')
     :format(GH_USER, GH_REPO, GH_BRANCH)
@@ -537,7 +537,8 @@ local function applyVersionText(text)
     local ver = tostring(text or ''):match('%d+%.%d+%.%d+')
     if not ver then return 'err' end
     remoteVersion = ver
-    updateAvailable = verLt(LOCAL_VERSION, ver)
+    -- ИЗМЕНЕНО: реагируем на любое отличие версий, а не только на повышение
+    updateAvailable = (LOCAL_VERSION ~= ver) 
     return updateAvailable and 'new' or 'same'
 end
 
@@ -654,13 +655,6 @@ doUpdate = function()
         end
 
         -- Защита от отката: не ставим версию старше текущей
-        local dlVer = body:match("script_version%s*%(%s*['\"]([%d%.]+)['\"]")
-        if dlVer and verLt(dlVer, LOCAL_VERSION) then
-            updaterStatus = L'на GitHub старее'
-            logAct('Download aborted: remote v' .. dlVer .. ' < local v' .. LOCAL_VERSION)
-            notify(L'На GitHub версия старее (v' .. dlVer .. ') - отмена', 0xFF0000)
-            return
-        end
         if dlVer and remoteVersion ~= '' and dlVer ~= remoteVersion then
             logAct('Warning: version.txt = ' .. remoteVersion .. ', file = ' .. dlVer)
         end
@@ -2156,18 +2150,21 @@ function main()
                 local okBusy, v = pcall(sampIsDialogActive)
                 busy = (okBusy and v) and true or false
             end
+            
             if not busy then
-                local shown = sampShowDialog(UPDATE_DIALOG_ID,
+                -- Показываем диалог без присвоения переменной shown
+                sampShowDialog(UPDATE_DIALOG_ID,
                     L'Обновление Help for Job',
                     string.format(L'Доступна версия: %s\nУ вас установлена: %s\n\nОбновить скрипт сейчас?',
                         remoteVersion, LOCAL_VERSION),
                     L'Обновить', L'Позже', 0)
-                if shown then
-                    pendingUpdatePrompt = false
-                    logAct('Update prompt shown for v' .. remoteVersion)
-                else
-                    promptRetryAt = now + 3
-                end
+                
+                -- Сразу сбрасываем флаг, чтобы диалог не спамил
+                pendingUpdatePrompt = false
+                logAct('Update prompt shown for v' .. remoteVersion)
+            else
+                -- Ждем 3 секунды только в том случае, если открыт другой диалог (busy == true)
+                promptRetryAt = now + 3
             end
         end
 
