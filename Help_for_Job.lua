@@ -1,10 +1,10 @@
 -- Help_for_Job.lua
 -- MonetLoader 3.8.x / MoonLoader
 -- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам + исправление автообновления
--- v29.0.2
+-- v29.0.3
 
 script_name('HfJ')
-script_version('29.0.2')
+script_version('29.0.3')
 
 local imgui    = require 'mimgui'
 local new      = imgui.new
@@ -13,7 +13,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local sampev = require 'samp.events'
 
-local VERSION       = '29.0.2'
+local VERSION       = '29.0.3'
 local LOCAL_VERSION = VERSION
 
 -- ============================================================
