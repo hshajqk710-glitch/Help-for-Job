@@ -1,10 +1,10 @@
 -- Help_for_Job.lua
 -- MonetLoader 3.8.x / MoonLoader
 -- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам + исправление автообновления
--- v29.0.3
+-- v29.0.2
 
 script_name('HfJ')
-script_version('29.0.3')
+script_version('29.0.2')
 
 local imgui    = require 'mimgui'
 local new      = imgui.new
@@ -13,7 +13,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local sampev = require 'samp.events'
 
-local VERSION       = '29.0.3'
+local VERSION       = '29.0.2'
 local LOCAL_VERSION = VERSION
 
 -- ============================================================
@@ -618,11 +618,6 @@ doUpdate = function()
         notify(L'Скачивание недоступно на этой сборке', 0xFF0000)
         return
     end
-    if not updateAvailable then
-        notify(L'Обновлений нет - проверяю заново...', 0xFFFF00)
-        doCheck(true, true)
-        return
-    end
 
     updateDownloading = true
     updaterStatus = L'скачиваю v' .. remoteVersion
@@ -1051,18 +1046,7 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
         tostring(id), tostring(b1), tostring(b2)))
 end
 
--- Ответ на диалог "Обновить сейчас / Позже"
-function sampev.onDialogResponse(id, button, list, input)
-    if tonumber(id) ~= UPDATE_DIALOG_ID then return end
-    logAct('Update dialog: button=' .. tostring(button))
-    if button == 1 then
-        doUpdate()
-    else
-        notify(L'Обновление отложено. Команда: /update', 0xFFAA00)
-    end
-    return false
-end
-
+-- (Этот блок нужно полностью удалить, оставь тут пустое место)
 -- ============================================================
 --  UI: МАСШТАБ, ЦВЕТА, ХЕЛПЕРЫ
 -- ============================================================
@@ -2142,6 +2126,21 @@ function main()
     while true do
         wait(0)
         local now = os.clock()
+
+        -- ОБРАБОТКА НАЖАТИЙ В НАШЕМ ЛОКАЛЬНОМ ДИАЛОГЕ ОБНОВЛЕНИЯ
+        local result, button, list, input = sampHasDialogRespond(UPDATE_DIALOG_ID)
+        if result then
+            logAct('Update dialog: button=' .. tostring(button))
+            pendingUpdatePrompt = false 
+            promptedVersion = remoteVersion
+
+            if button == 1 then
+                updateAvailable = true
+                doUpdate()
+            else
+                notify(L'Обновление отложено. Команда: /update', 0xFFAA00)
+            end
+        end
 
         -- Диалог "Доступно обновление?" показываем из главного потока
         if pendingUpdatePrompt and now >= promptRetryAt then
