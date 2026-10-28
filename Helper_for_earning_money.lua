@@ -1,9 +1,10 @@
--- Helper_for_earning_money.lua
+-- Help_for_Job.lua
 -- MonetLoader 3.8.x / MoonLoader
--- v28.3.0
+-- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам
+-- v29.0.0
 
-script_name('TaxOrd')
-script_version('28.3.0')
+script_name('HfJ')
+script_version('29.0.0')
 
 local imgui    = require 'mimgui'
 local new      = imgui.new
@@ -12,7 +13,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local sampev = require 'samp.events'
 
-local VERSION       = '28.3.0'
+local VERSION       = '29.0.0'
 local LOCAL_VERSION = VERSION
 
 -- ============================================================
@@ -97,6 +98,10 @@ local statDispOrders  = 0
 local statDispMoney   = 0
 local statInit        = false
 
+-- Тумблеры создаём один раз: new.bool каждый кадр = мусор и утечки
+local tgCatch  = new.bool(false)
+local tgAccept = new.bool(false)
+
 -- ============================================================
 --  НОРМАЛИЗАЦИЯ СТРОК
 -- ============================================================
@@ -121,14 +126,15 @@ end
 local WORK_DIR    = getWorkingDirectory()
 local CONFIG_DIR  = WORK_DIR .. '/config'
 local LOG_DIR     = WORK_DIR .. '/logs'
-local CONFIG_FILE = CONFIG_DIR .. '/taxord.cfg'
-local LOG_FILE    = LOG_DIR .. '/taxord.log'
+local CONFIG_FILE = CONFIG_DIR .. '/hfj.cfg'
+local LEGACY_CONFIG_FILE = CONFIG_DIR .. '/taxord.cfg'
+local LOG_FILE    = LOG_DIR .. '/hfj.log'
 
 if not doesDirectoryExist(CONFIG_DIR) then pcall(createDirectory, CONFIG_DIR) end
 if not doesDirectoryExist(LOG_DIR)    then pcall(createDirectory, LOG_DIR)    end
 
 local function logRaw(msg)
-    print('[TaxOrd] ' .. msg)
+    print('[HfJ] ' .. msg)
     local f = io.open(LOG_FILE, 'a')
     if f then
         f:write(os.date('%H:%M:%S.') ..
@@ -139,7 +145,7 @@ local function logRaw(msg)
 end
 local function logInit()
     local f = io.open(LOG_FILE, 'w')
-    if f then f:write('=== TaxOrd v' .. VERSION .. ' ' .. os.date() .. ' ===\n'); f:close() end
+    if f then f:write('=== Help for Job v' .. VERSION .. ' ' .. os.date() .. ' ===\n'); f:close() end
 end
 local function logChat(t) logRaw('CHAT  | ' .. tostring(t)) end
 local function logAct(t)  logRaw('ACT   | ' .. tostring(t)) end
@@ -197,6 +203,7 @@ end
 
 local function loadCfg()
     local f = io.open(CONFIG_FILE, 'r')
+    if not f then f = io.open(LEGACY_CONFIG_FILE, 'r') end   -- стата из TaxOrd
     if not f then return end
     for line in f:lines() do
         local k, v = line:match('^([^=]+)=(.*)$')
@@ -282,7 +289,7 @@ local function canShowNotify()
 end
 
 local function acquireNotifyLock()
-    _G.__notify_lock = { owner = 'taxord',
+    _G.__notify_lock = { owner = 'hfj',
         expire = os.clock() + NOTIFY_DURATION + NOTIFY_ANIM_IN + NOTIFY_ANIM_OUT }
 end
 
@@ -330,14 +337,15 @@ end
 
 local function notify(text, color)
     logAct('NOTIFY: ' .. tostring(text))
-    sampAddChatMessage('{FFCC00}[TaxOrd] {FFFFFF}' .. tostring(text), color or -1)
+    sampAddChatMessage('{FFCC00}[HfJ] {FFFFFF}' .. tostring(text), color or -1)
     table.insert(sn.queue, { text = tostring(text), icon = iconFromColor(color) })
 end
 
 -- ============================================================
 --  UPDATER
 -- ============================================================
-local SCRIPT_FILENAME = 'Helper_for_earning_money.lua'
+-- Имя файла ИМЕННО В РЕПОЗИТОРИИ (локально файл может называться иначе)
+local SCRIPT_FILENAME = 'Help_for_Job.lua'
 local GH_USER, GH_REPO, GH_BRANCH = 'hshajqk710-glitch', 'taxord', 'main'
 
 local UPDATE_URL_VERSION = ('https://raw.githubusercontent.com/%s/%s/%s/version.txt')
@@ -473,7 +481,7 @@ local function socketFetch(url)
 end
 
 local function rawFetch(url, timeout)
-    local tmp = WORK_DIR .. '/taxord_upd_tmp.txt'
+    local tmp = WORK_DIR .. '/hfj_upd_tmp.txt'
     os.remove(tmp)
     local finished = false
     local ok = pcall(downloadUrlToFile, urlNoCache(url), tmp, function(id, status)
@@ -657,7 +665,7 @@ doUpdate = function()
             logAct('Warning: version.txt = ' .. remoteVersion .. ', file = ' .. dlVer)
         end
 
-        local tmp = WORK_DIR .. '/taxord_update.lua'
+        local tmp = WORK_DIR .. '/hfj_update.lua'
         if not writeFile(tmp, body) then
             updaterStatus = L'ошибка записи'
             notify(L'Не удалось записать обновление', 0xFF0000)
@@ -1062,84 +1070,230 @@ function sampev.onDialogResponse(id, button, list, input)
 end
 
 -- ============================================================
---  UI
+--  UI: МАСШТАБ, ЦВЕТА, ХЕЛПЕРЫ
 -- ============================================================
+local UI_SCALE = 1.0
+local function SC(v) return math.floor(v * UI_SCALE + 0.5) end
+
+local COL = {
+    accent    = imgui.ImVec4(1.00, 0.78, 0.05, 1.00),
+    accentSoft= imgui.ImVec4(1.00, 0.78, 0.05, 0.45),
+    orange    = imgui.ImVec4(1.00, 0.52, 0.10, 1.00),
+    text      = imgui.ImVec4(0.95, 0.96, 0.98, 1.00),
+    dim       = imgui.ImVec4(0.62, 0.68, 0.76, 1.00),
+    green     = imgui.ImVec4(0.25, 0.85, 0.40, 1.00),
+    red       = imgui.ImVec4(0.95, 0.32, 0.32, 1.00),
+}
+local function C(v) return imgui.ColorConvertFloat4ToU32(v) end
+
 local LastTime   = {}
 local LastActive = {}
 
+-- Тумблер: крупный, «пилюля» + подпись, работает и по тапу на подпись
 function ToggleButton(label, bool, a_speed)
+    local dt = 0.016
+    pcall(function()
+        local d = imgui.GetIO().DeltaTime
+        if d and d > 0 then dt = math.min(0.1, d) end
+    end)
+
+    local h     = SC(30)
+    local w     = SC(58)
+    local r     = h / 2
+    local gap   = SC(14)
+    local tw    = imgui.CalcTextSize(label).x
+    local total = w + gap + tw
+
     local p  = imgui.GetCursorScreenPos()
     local dl = imgui.GetWindowDrawList()
+
     local result = false
-    local h = imgui.GetTextLineHeightWithSpacing()
-    local w = h * 1.7
-    local r = h / 2
-    local s = a_speed or 0.2
-
-    local function ImSaturate(f) return f < 0.0 and 0.0 or (f > 1.0 and 1.0 or f) end
-    local x_begin = bool[0] and 1.0 or 0.0
-    local t_begin = bool[0] and 0.0 or 1.0
-
-    if imgui.InvisibleButton(label, imgui.ImVec2(w, h)) then
+    if imgui.InvisibleButton('##tg_' .. label, imgui.ImVec2(total, h)) then
         bool[0] = not bool[0]
         LastTime[label] = os.clock()
         LastActive[label] = true
         togglePulse[label] = 1
         result = true
     end
+    local hovered = imgui.IsItemHovered()
 
+    local s = a_speed or 0.18
+    local x_begin = bool[0] and 1.0 or 0.0
     if LastActive[label] then
         local time = os.clock() - LastTime[label]
         if time <= s then
-            local anim = ImSaturate(time / s)
+            local anim = time / s
+            if anim < 0 then anim = 0 elseif anim > 1 then anim = 1 end
             x_begin = bool[0] and anim or 1.0 - anim
-            t_begin = bool[0] and 1.0 - anim or anim
         else
             LastActive[label] = false
         end
     end
 
-    if togglePulse[label] and togglePulse[label] > 0 then
-        togglePulse[label] = math.max(0, togglePulse[label] - 0.08)
-    end
+    togglePulse[label] = math.max(0, (togglePulse[label] or 0) - dt * 3.2)
     local pulse = togglePulse[label] or 0
 
-    local bg_color = imgui.ImVec4(x_begin * 0.13, x_begin * 0.9, x_begin * 0.13,
-        imgui.IsItemHovered(0) and 0.7 or 0.9)
-    local t_color  = imgui.ImVec4(1, 1, 1, x_begin)
+    local on = x_begin
+    local bg = imgui.ImVec4(
+        0.16 + (1.00 - 0.16) * on,
+        0.17 + (0.78 - 0.17) * on,
+        0.20 + (0.05 - 0.20) * on,
+        hovered and 1.0 or 0.92)
+    local knobX = p.x + r + on * (w - r * 2)
+
+    dl:AddRectFilled(imgui.ImVec2(p.x, p.y + SC(2)),
+        imgui.ImVec2(p.x + w, p.y + h + SC(2)),
+        C(imgui.ImVec4(0, 0, 0, 0.35)), r)
 
     if pulse > 0 then
-        dl:AddCircleFilled(
-            imgui.ImVec2(p.x + r + x_begin * (w - r * 2), p.y + r),
-            r + 4 + pulse * 6,
-            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 0.78, 0.05, pulse * 0.4)),
-            r + 8)
+        dl:AddRectFilled(imgui.ImVec2(p.x - SC(2), p.y - SC(2)),
+            imgui.ImVec2(p.x + w + SC(2), p.y + h + SC(2)),
+            C(imgui.ImVec4(1.0, 0.78, 0.05, pulse * 0.30)), r + SC(2))
     end
 
-    dl:AddRectFilled(imgui.ImVec2(p.x, p.y), imgui.ImVec2(p.x + w, p.y + h),
-        imgui.ColorConvertFloat4ToU32(bg_color), r)
-    dl:AddCircleFilled(
-        imgui.ImVec2(p.x + r + x_begin * (w - r * 2), p.y + r),
-        t_begin < 0.5 and x_begin * r or t_begin * r,
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.9, 0.9, 0.9, 1.0)), r + 5)
-    dl:AddText(
-        imgui.ImVec2(p.x + w + r, p.y + r - (r / 2) - (imgui.CalcTextSize(label).y / 4)),
-        imgui.ColorConvertFloat4ToU32(t_color), label)
+    dl:AddRectFilled(imgui.ImVec2(p.x, p.y), imgui.ImVec2(p.x + w, p.y + h), C(bg), r)
+    dl:AddCircleFilled(imgui.ImVec2(knobX, p.y + r), r - SC(3),
+        C(imgui.ImVec4(0.97, 0.97, 0.98, 1)), 28)
+    dl:AddCircle(imgui.ImVec2(knobX, p.y + r), r - SC(3),
+        C(imgui.ImVec4(0, 0, 0, 0.16)), 28, 1)
+
+    dl:AddText(imgui.ImVec2(p.x + w + gap, p.y + (h - imgui.CalcTextSize(label).y) / 2),
+        C(imgui.ImVec4(0.93, 0.95, 0.98, 1)), label)
     return result
 end
 
+-- Карточка с золотой полоской и заголовком
 function GlassChild(name, size, fun)
-    imgui.PushStyleColor(imgui.Col.ChildBg, imgui.ImVec4(1, 1, 1, 0.08))
+    local pad = SC(16)
+    local r   = SC(14)
+    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(0, 0))
+    imgui.PushStyleColor(imgui.Col.ChildBg, imgui.ImVec4(1, 1, 1, 0.045))
     local visible = imgui.BeginChild(name, size, false)
     if visible then
-        imgui.SetCursorPos(imgui.ImVec2(10, 10))
-        imgui.Text(name)
-        imgui.Separator()
-        imgui.SetCursorPosY(56)
+        local DL = imgui.GetWindowDrawList()
+        local wp, ws = imgui.GetWindowPos(), imgui.GetWindowSize()
+        local origin = imgui.GetCursorScreenPos()
+
+        DL:AddRect(
+            imgui.ImVec2(wp.x + 1, wp.y + 1),
+            imgui.ImVec2(wp.x + ws.x - 1, wp.y + ws.y - 1),
+            C(imgui.ImVec4(1, 1, 1, 0.08)), r, 0, 1)
+
+        DL:AddRectFilled(
+            imgui.ImVec2(origin.x + SC(7), origin.y + SC(7)),
+            imgui.ImVec2(origin.x + SC(11), origin.y + SC(27)),
+            C(COL.accent), SC(2))
+
+        imgui.SetCursorPos(imgui.ImVec2(pad + SC(8), pad - SC(2)))
+        if FONT_SUB then imgui.PushFont(FONT_SUB) end
+        imgui.TextColored(imgui.ImVec4(1.00, 0.88, 0.42, 1.00), name)
+        if FONT_SUB then imgui.PopFont() end
+
+        local lineY = imgui.GetCursorScreenPos().y + SC(6)
+        DL:AddLine(imgui.ImVec2(origin.x + pad, lineY),
+            imgui.ImVec2(origin.x + size.x - pad, lineY),
+            C(imgui.ImVec4(1, 1, 1, 0.10)), 1)
+
+        imgui.SetCursorPos(imgui.ImVec2(pad, pad + SC(38)))
         fun()
     end
     imgui.EndChild()
     imgui.PopStyleColor()
+    imgui.PopStyleVar()
+end
+
+-- Крупная кнопка на всю ширину карточки
+local btnHover = {}
+local function AccentButton(label, height, primary)
+    local w = math.max(SC(80), imgui.GetContentRegionAvail().x - SC(14))
+    local h = height or SC(50)
+    local p = imgui.GetCursorScreenPos()
+    local DL = imgui.GetWindowDrawList()
+    local r = SC(12)
+
+    imgui.InvisibleButton('##hfj_btn_' .. label, imgui.ImVec2(w, h))
+    local clicked = imgui.IsItemClicked()
+    local hovered = imgui.IsItemHovered()
+    local active  = imgui.IsItemActive()
+
+    local hv = btnHover[label] or 0
+    hv = hv + ((hovered and 1 or 0) - hv) * 0.25
+    btnHover[label] = hv
+
+    local bg, border, tc
+    if primary then
+        bg = imgui.ImVec4(1.00, 0.78 - hv * 0.10, 0.05 + hv * 0.12, active and 1.0 or 0.95)
+        border = imgui.ImVec4(1.0, 0.90, 0.45, 0.45)
+        tc = imgui.ImVec4(0.06, 0.06, 0.06, 1.0)
+    else
+        bg = imgui.ImVec4(0.13 + hv * 0.05, 0.15 + hv * 0.06, 0.19 + hv * 0.07, 0.95)
+        border = imgui.ImVec4(1, 1, 1, 0.10 + hv * 0.10)
+        tc = imgui.ImVec4(0.92, 0.94, 0.97, 1.0)
+    end
+
+    DL:AddRectFilled(imgui.ImVec2(p.x, p.y + SC(2)), imgui.ImVec2(p.x + w, p.y + h + SC(2)),
+        C(imgui.ImVec4(0, 0, 0, 0.30)), r)
+    DL:AddRectFilled(p, imgui.ImVec2(p.x + w, p.y + h), C(bg), r)
+    DL:AddRect(p, imgui.ImVec2(p.x + w, p.y + h), C(border), r, 0, 1.5)
+
+    local ts = imgui.CalcTextSize(label)
+    DL:AddText(imgui.ImVec2(p.x + (w - ts.x) / 2, p.y + (h - ts.y) / 2), C(tc), label)
+    return clicked
+end
+
+-- Мелкая подпись
+local function Label(text)
+    if FONT_SUB then imgui.PushFont(FONT_SUB) end
+    imgui.TextColored(COL.dim, text)
+    if FONT_SUB then imgui.PopFont() end
+end
+
+-- Крупное значение
+local function BigValue(text, col)
+    if FONT_BIG then imgui.PushFont(FONT_BIG) end
+    imgui.TextColored(col or COL.accent, text)
+    if FONT_BIG then imgui.PopFont() end
+end
+
+-- Разделитель
+local function Divider(alpha)
+    local DL = imgui.GetWindowDrawList()
+    local p = imgui.GetCursorScreenPos()
+    local w = math.max(10, imgui.GetContentRegionAvail().x - SC(14))
+    DL:AddLine(p, imgui.ImVec2(p.x + w, p.y), C(imgui.ImVec4(1, 1, 1, alpha or 0.10)), 1)
+    imgui.SetCursorPosY(imgui.GetCursorPosY() + SC(10))
+end
+
+-- Плашка-статус
+local function Pill(text, col)
+    local p = imgui.GetCursorScreenPos()
+    local DL = imgui.GetWindowDrawList()
+    local ts = imgui.CalcTextSize(text)
+    local h = ts.y + SC(10)
+    local w = ts.x + SC(26)
+
+    DL:AddRectFilled(p, imgui.ImVec2(p.x + w, p.y + h),
+        C(imgui.ImVec4(col.x, col.y, col.z, 0.15)), h / 2)
+    DL:AddRect(p, imgui.ImVec2(p.x + w, p.y + h),
+        C(imgui.ImVec4(col.x, col.y, col.z, 0.45)), h / 2, 0, 1)
+    DL:AddText(imgui.ImVec2(p.x + SC(13), p.y + SC(5)), C(col), text)
+    imgui.SetCursorPosY(imgui.GetCursorPosY() + h + SC(4))
+end
+
+-- Полоса прогресса
+local function ProgressBar(frac, height, col)
+    local p = imgui.GetCursorScreenPos()
+    local w = math.max(10, imgui.GetContentRegionAvail().x - SC(14))
+    local h = height or SC(12)
+    local DL = imgui.GetWindowDrawList()
+    frac = math.max(0, math.min(1, frac or 0))
+
+    DL:AddRectFilled(p, imgui.ImVec2(p.x + w, p.y + h),
+        C(imgui.ImVec4(1, 1, 1, 0.10)), h / 2)
+    if frac > 0 then
+        DL:AddRectFilled(p, imgui.ImVec2(p.x + w * frac, p.y + h), C(col or COL.accent), h / 2)
+    end
+    imgui.SetCursorPosY(imgui.GetCursorPosY() + h + SC(6))
 end
 
 -- ============================================================
@@ -1148,68 +1302,64 @@ end
 local function DrawLogo(x, y)
     local DL = imgui.GetWindowDrawList()
     local p  = imgui.ImVec2(x, y)
-    local panelW, panelH = 210, 70
 
+    local cardW, cardH = SC(238), SC(82)
+    local r            = SC(15)
+    local badge        = SC(56)
+
+    -- тень карточки
     DL:AddRectFilled(
-        imgui.ImVec2(p.x + 3, p.y + 4),
-        imgui.ImVec2(p.x + panelW + 3, p.y + panelH + 4),
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0, 0, 0, 0.55)), 11)
+        imgui.ImVec2(p.x + SC(3), p.y + SC(4)),
+        imgui.ImVec2(p.x + cardW + SC(3), p.y + cardH + SC(4)),
+        C(imgui.ImVec4(0, 0, 0, 0.45)), r)
 
-    DL:AddRectFilled(
-        imgui.ImVec2(p.x, p.y),
-        imgui.ImVec2(p.x + panelW, p.y + panelH),
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 1.0)), 11)
+    -- сама карточка
+    DL:AddRectFilled(p, imgui.ImVec2(p.x + cardW, p.y + cardH),
+        C(imgui.ImVec4(0.09, 0.10, 0.13, 0.97)), r)
+    DL:AddRect(p, imgui.ImVec2(p.x + cardW, p.y + cardH),
+        C(imgui.ImVec4(1.0, 0.78, 0.05, 0.22)), r, 0, 1.5)
 
-    local t = (os.clock() % 4.0) / 4.0
-    if t < 0.35 then
-        local sx = p.x - 40 + (panelW + 80) * (t / 0.35)
-        DL:PushClipRect(
-            imgui.ImVec2(p.x, p.y),
-            imgui.ImVec2(p.x + panelW, p.y + panelH), true)
+    -- блик по карточке
+    local t = (os.clock() % 5.0) / 5.0
+    if t < 0.30 then
+        local sx = p.x - SC(40) + (cardW + SC(80)) * (t / 0.30)
+        DL:PushClipRect(p, imgui.ImVec2(p.x + cardW, p.y + cardH), true)
         DL:AddRectFilled(
-            imgui.ImVec2(sx - 20, p.y - 5),
-            imgui.ImVec2(sx + 20, p.y + panelH + 5),
-            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 1, 1, 0.28)), 10)
+            imgui.ImVec2(sx - SC(20), p.y - SC(4)),
+            imgui.ImVec2(sx + SC(20), p.y + cardH + SC(4)),
+            C(imgui.ImVec4(1, 1, 1, 0.10)), SC(10))
         DL:PopClipRect()
     end
 
-    DL:AddRect(
-        imgui.ImVec2(p.x, p.y),
-        imgui.ImVec2(p.x + panelW, p.y + panelH),
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)), 11, 0, 2)
-
-    local stripes = 6
-    local stripeH = panelH / stripes
-    for i = 0, stripes - 1 do
-        if i % 2 == 0 then
-            DL:AddRectFilled(
-                imgui.ImVec2(p.x + 1, p.y + i * stripeH + 1),
-                imgui.ImVec2(p.x + 12, p.y + (i + 1) * stripeH - 1),
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)), 0)
-            DL:AddRectFilled(
-                imgui.ImVec2(p.x + panelW - 12, p.y + i * stripeH + 1),
-                imgui.ImVec2(p.x + panelW - 1, p.y + (i + 1) * stripeH - 1),
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)), 0)
-        end
-    end
-
-    local pulse = 0.5 + 0.5 * math.sin(os.clock() * 2.5)
-    DL:AddCircleFilled(imgui.ImVec2(p.x + 38, p.y + panelH / 2), 20,
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)))
-    DL:AddCircle(imgui.ImVec2(p.x + 38, p.y + panelH / 2), 20,
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.4 + pulse * 0.6)), 24, 2)
+    -- золотой бейдж HfJ
+    local bx, by = p.x + SC(13), p.y + (cardH - badge) / 2
+    DL:AddRectFilled(imgui.ImVec2(bx, by + SC(2)),
+        imgui.ImVec2(bx + badge, by + badge + SC(2)),
+        C(imgui.ImVec4(0, 0, 0, 0.35)), SC(14))
+    DL:AddRectFilled(imgui.ImVec2(bx, by),
+        imgui.ImVec2(bx + badge, by + badge),
+        C(imgui.ImVec4(1.00, 0.78, 0.05, 1.0)), SC(14))
+    DL:AddRectFilled(imgui.ImVec2(bx, by),
+        imgui.ImVec2(bx + badge, by + badge * 0.45),
+        C(imgui.ImVec4(1.0, 0.90, 0.45, 0.35)), SC(14), 1 + 2)
 
     if FONT_LOGO then imgui.PushFont(FONT_LOGO) end
-    DL:AddText(
-        imgui.ImVec2(p.x + 28, p.y + panelH / 2 - 15),
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 1.0)), 'T')
+    local mark = 'HfJ'
+    local ms   = imgui.CalcTextSize(mark)
+    DL:AddText(imgui.ImVec2(bx + (badge - ms.x) / 2, by + (badge - ms.y) / 2),
+        C(imgui.ImVec4(0.07, 0.07, 0.08, 1.0)), mark)
     if FONT_LOGO then imgui.PopFont() end
 
-    if FONT_LOGO then imgui.PushFont(FONT_LOGO) end
-    DL:AddText(
-        imgui.ImVec2(p.x + 70, p.y + 15),
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)), 'TAXORD')
-    if FONT_LOGO then imgui.PopFont() end
+    -- название в две строки
+    local tx = bx + badge + SC(13)
+    if FONT_BIG then imgui.PushFont(FONT_BIG) end
+    local t1 = 'HELP FOR'
+    local s1 = imgui.CalcTextSize(t1)
+    DL:AddText(imgui.ImVec2(tx, p.y + SC(12)),
+        C(imgui.ImVec4(0.96, 0.97, 0.99, 1.0)), t1)
+    DL:AddText(imgui.ImVec2(tx, p.y + SC(12) + s1.y),
+        C(imgui.ImVec4(1.00, 0.78, 0.05, 1.0)), 'JOB')
+    if FONT_BIG then imgui.PopFont() end
 end
 
 -- ============================================================
@@ -1227,31 +1377,59 @@ local function GlassWindow(title, var, closeButton, leftSize, tabs, flags)
         winPosInit = true
     end
 
-    local defW = math.min(1200, sw - 60)
-    local defH = math.min(800,  sh - 60)
-    local minW = math.min(760, sw - 60)
-    local minH = math.min(560, sh - 60)
+    local edge = math.max(SC(12), math.min(SC(40), sw * 0.03))
+    local defW = math.min(SC(1180), sw - edge * 2)
+    local defH = math.min(SC(780),  sh - edge * 2)
+    local minW = math.min(SC(720),  sw - edge * 2)
+    local minH = math.min(SC(520),  sh - edge * 2)
 
     -- Вместо SetWindowPos используем SetNextWindowPos, он безопасен
     imgui.SetNextWindowPos(winPos, imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
     imgui.SetNextWindowSize(imgui.ImVec2(defW, defH), imgui.Cond.FirstUseEver)
     imgui.SetNextWindowSizeConstraints(
         imgui.ImVec2(minW, minH),
-        imgui.ImVec2(math.max(minW, sw - 40), math.max(minH, sh - 40)))
+        imgui.ImVec2(math.max(minW, sw - edge), math.max(minH, sh - edge)))
 
     imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, windowAlpha)
 
-    if imgui.Begin('glassmorphism', var,
+    if imgui.Begin('##' .. title, var,
         imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoBackground
         + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollbar + (flags or 0)) then
 
         local pos, wsize = imgui.GetWindowPos(), imgui.GetWindowSize()
         local FGDL = imgui.GetForegroundDrawList()
         local DL   = imgui.GetWindowDrawList()
+        local BGDL = imgui.GetBackgroundDrawList()
+        local R    = SC(18)
+        local a    = windowAlpha
 
-        -- Перетаскивание
-        imgui.SetCursorPos(imgui.ImVec2(40, 0))
-        imgui.InvisibleButton('##window_drag', imgui.ImVec2(math.max(10, wsize.x - 60), 46))
+        -- Мягкая тень под окном
+        BGDL:AddRectFilled(
+            imgui.ImVec2(pos.x - SC(6), pos.y - SC(6)),
+            imgui.ImVec2(pos.x + wsize.x + SC(6), pos.y + wsize.y + SC(10)),
+            C(imgui.ImVec4(0, 0, 0, 0.45 * a)), R + SC(6))
+
+        -- Фон окна
+        DL:AddRectFilled(pos, imgui.ImVec2(pos.x + wsize.x, pos.y + wsize.y),
+            C(imgui.ImVec4(0.055, 0.062, 0.078, 0.96 * a)), R)
+
+        -- Сайдбар
+        DL:AddRectFilled(pos, imgui.ImVec2(pos.x + leftSize, pos.y + wsize.y),
+            C(imgui.ImVec4(0.032, 0.037, 0.048, 0.96 * a)), R, 1 + 4)
+
+        -- Разделитель сайдбар / контент
+        DL:AddLine(imgui.ImVec2(pos.x + leftSize, pos.y + SC(12)),
+            imgui.ImVec2(pos.x + leftSize, pos.y + wsize.y - SC(12)),
+            C(imgui.ImVec4(1, 1, 1, 0.07 * a)), SC(1))
+
+        -- Внешняя рамка
+        DL:AddRect(pos, imgui.ImVec2(pos.x + wsize.x, pos.y + wsize.y),
+            C(imgui.ImVec4(1.0, 0.78, 0.05, 0.20 * a)), R, 0, SC(1))
+
+        -- Перетаскивание (шапка)
+        imgui.SetCursorPos(imgui.ImVec2(SC(52), 0))
+        imgui.InvisibleButton('##window_drag',
+            imgui.ImVec2(math.max(SC(10), wsize.x - SC(52) - SC(150)), SC(52)))
         if imgui.IsItemActive() and imgui.IsMouseDragging(0) then
             local d = imgui.GetIO().MouseDelta
             winPos.x = winPos.x + d.x
@@ -1260,101 +1438,138 @@ local function GlassWindow(title, var, closeButton, leftSize, tabs, flags)
 
         -- Индикатор ресайза
         do
-            local c = imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.55))
+            local c = C(imgui.ImVec4(1.0, 0.78, 0.05, 0.55 * a))
             for i = 1, 3 do
                 DL:AddLine(
-                    imgui.ImVec2(pos.x + wsize.x - 4,        pos.y + wsize.y - 4 - i * 5),
-                    imgui.ImVec2(pos.x + wsize.x - 4 - i * 5, pos.y + wsize.y - 4),
-                    c, 1.5)
+                    imgui.ImVec2(pos.x + wsize.x - SC(4),        pos.y + wsize.y - SC(4) - i * SC(5)),
+                    imgui.ImVec2(pos.x + wsize.x - SC(4) - i * SC(5), pos.y + wsize.y - SC(4)),
+                    c, SC(1.5))
             end
         end
 
-        DL:AddRectFilled(
-            imgui.ImVec2(pos.x + leftSize, pos.y),
-            imgui.ImVec2(pos.x + wsize.x, pos.y + wsize.y),
-            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 0.72)), 11, 2 + 8)
-        DL:AddRectFilled(
-            pos,
-            imgui.ImVec2(pos.x + leftSize, pos.y + wsize.y),
-            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 0.55)), 11, 1 + 4)
-
+        -- Статус-пилюля в шапке
         do
-            local pulse = 0.55 + 0.45 * math.sin(os.clock() * 2.5)
-            local dotColor = hasActiveOrder
-                and imgui.ImVec4(0.2, 1.0, 0.3, pulse)
-                or  imgui.ImVec4(1.0, 0.8, 0.2, pulse)
-            DL:AddCircleFilled(imgui.ImVec2(pos.x + wsize.x - 24, pos.y + 24), 6,
-                imgui.ColorConvertFloat4ToU32(dotColor))
-            DL:AddCircle(imgui.ImVec2(pos.x + wsize.x - 24, pos.y + 24), 10,
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(dotColor.x, dotColor.y, dotColor.z, pulse * 0.4)), 20, 1.5)
+            local pulse = 0.55 + 0.45 * math.sin(os.clock() * 3.0)
+            local stxt  = hasActiveOrder and u8(L'В заказе') or u8(L'Свободен')
+            local scol  = hasActiveOrder and COL.green or COL.dim
+
+            if FONT_SUB then imgui.PushFont(FONT_SUB) end
+            local sts = imgui.CalcTextSize(stxt)
+            local ph  = sts.y + SC(12)
+            local pw  = sts.x + SC(42)
+            local px  = pos.x + wsize.x - pw - SC(18)
+            local py  = pos.y + SC(16)
+
+            DL:AddRectFilled(imgui.ImVec2(px, py), imgui.ImVec2(px + pw, py + ph),
+                C(imgui.ImVec4(scol.x, scol.y, scol.z, 0.13 * a)), ph / 2)
+            DL:AddRect(imgui.ImVec2(px, py), imgui.ImVec2(px + pw, py + ph),
+                C(imgui.ImVec4(scol.x, scol.y, scol.z, 0.40 * a)), ph / 2, 0, SC(1))
+            DL:AddCircleFilled(imgui.ImVec2(px + SC(16), py + ph / 2), SC(4),
+                C(imgui.ImVec4(scol.x, scol.y, scol.z, pulse)))
+            DL:AddText(imgui.ImVec2(px + SC(28), py + (ph - sts.y) / 2),
+                C(imgui.ImVec4(0.84, 0.88, 0.93, 1.0)), stxt)
+            if FONT_SUB then imgui.PopFont() end
         end
 
-        imgui.SetCursorPos(imgui.ImVec2(15, 15))
-        local cp = imgui.GetCursorScreenPos()
-        imgui.InvisibleButton('##CLOSEBUTTON', imgui.ImVec2(22, 22))
-        if imgui.IsItemClicked() then var[0] = false end
-        local hover = imgui.IsItemHovered()
-        FGDL:AddCircleFilled(imgui.ImVec2(cp.x + 11, cp.y + 11), 9,
-            imgui.ColorConvertFloat4ToU32(hover and imgui.ImVec4(0.9, 0.28, 0.28, 1) or imgui.ImVec4(1, 0.32, 0.31, 1)))
-        if hover then
-            FGDL:AddCircle(imgui.ImVec2(cp.x + 11, cp.y + 11), 11,
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 0.32, 0.31, 0.4)), 20, 1.5)
+        -- Кнопка закрытия
+        do
+            local cs = SC(30)
+            imgui.SetCursorPos(imgui.ImVec2(SC(14), SC(14)))
+            local cp = imgui.GetCursorScreenPos()
+            imgui.InvisibleButton('##CLOSEBUTTON', imgui.ImVec2(cs, cs))
+            if imgui.IsItemClicked() then var[0] = false end
+            local hover = imgui.IsItemHovered()
+
+            local cx, cy = cp.x + cs / 2, cp.y + cs / 2
+            local bg = hover and imgui.ImVec4(0.95, 0.32, 0.32, 1.0)
+                             or  imgui.ImVec4(0.16, 0.11, 0.12, 1.0)
+            FGDL:AddCircleFilled(imgui.ImVec2(cx, cy), cs / 2, C(bg))
+            FGDL:AddCircle(imgui.ImVec2(cx, cy), cs / 2,
+                C(hover and imgui.ImVec4(1, 0.42, 0.42, 0.55)
+                           or imgui.ImVec4(1, 0.32, 0.31, 0.30)), 24, SC(1))
+
+            local d = SC(6)
+            local xc = hover and imgui.ImVec4(1, 1, 1, 1) or imgui.ImVec4(0.92, 0.55, 0.55, 1)
+            FGDL:AddLine(imgui.ImVec2(cx - d, cy - d), imgui.ImVec2(cx + d, cy + d), C(xc), SC(2))
+            FGDL:AddLine(imgui.ImVec2(cx - d, cy + d), imgui.ImVec2(cx + d, cy - d), C(xc), SC(2))
         end
 
-        DrawLogo(pos.x + 20, pos.y + 50)
+        -- Логотип HfJ
+        DrawLogo(pos.x + SC(15), pos.y + SC(56))
 
+        -- Подпись под логотипом
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        imgui.SetCursorPos(imgui.ImVec2(24, 135))
-        imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1.0), u8(L'Автоловля заказов'))
+        DL:AddText(imgui.ImVec2(pos.x + SC(18), pos.y + SC(150)),
+            C(imgui.ImVec4(0.55, 0.61, 0.70, 1.0)), u8(L'помощник по работе'))
         if FONT_SUB then imgui.PopFont() end
 
-        imgui.SetCursorPos(imgui.ImVec2(15, 175))
+        -- Табы сайдбара
+        local th = SC(54)
+        local tw = leftSize - SC(30)
+        imgui.SetCursorPos(imgui.ImVec2(SC(15), SC(186)))
         for categoryIndex, category in pairs(tabs.tabs) do
             for tabIndex, tab in pairs(category.list) do
-                local key  = ('%s:%s'):format(categoryIndex, tabIndex)
+                local key   = ('%s:%s'):format(categoryIndex, tabIndex)
                 local isSel = tabs.selected == key
                 if tabHover[key] == nil then tabHover[key] = isSel and 1 or 0 end
 
                 local tpos = imgui.GetCursorScreenPos()
-                local th = 42
-                local tw = leftSize - 30
-
-                imgui.SetCursorPosX(20)
+                imgui.SetCursorPosX(SC(15))
                 imgui.InvisibleButton('##TAB_' .. key, imgui.ImVec2(tw, th))
                 local hovered = imgui.IsItemHovered()
-                local target = (hovered or isSel) and 1 or 0
+                local target  = (hovered or isSel) and 1 or 0
                 tabHover[key] = tabHover[key] + (target - tabHover[key]) * 0.22
 
                 local hv = tabHover[key]
-                local bgCol = isSel and imgui.ImVec4(1.0, 0.78, 0.05, 0.95) or imgui.ImVec4(0.13 + hv * 0.06, 0.13 + hv * 0.06, 0.13 + hv * 0.06, 0.85)
-
                 if isSel then
-                    DL:AddRectFilled(imgui.ImVec2(tpos.x - 3, tpos.y - 3), imgui.ImVec2(tpos.x + tw + 3, tpos.y + th + 3),
-                        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.18)), 10)
+                    DL:AddRectFilled(
+                        imgui.ImVec2(tpos.x - SC(2), tpos.y - SC(2)),
+                        imgui.ImVec2(tpos.x + tw + SC(2), tpos.y + th + SC(2)),
+                        C(imgui.ImVec4(1.0, 0.78, 0.05, 0.15 * a)), SC(13))
                 end
-                DL:AddRectFilled(tpos, imgui.ImVec2(tpos.x + tw, tpos.y + th), imgui.ColorConvertFloat4ToU32(bgCol), 8)
-                if isSel then
+
+                local bgCol = isSel
+                    and imgui.ImVec4(1.00, 0.78, 0.05, 0.97 * a)
+                    or  imgui.ImVec4(0.10 + hv * 0.05, 0.11 + hv * 0.05, 0.13 + hv * 0.06, 0.88 * a)
+                DL:AddRectFilled(tpos, imgui.ImVec2(tpos.x + tw, tpos.y + th),
+                    C(bgCol), SC(12))
+                if not isSel then
                     DL:AddRect(tpos, imgui.ImVec2(tpos.x + tw, tpos.y + th),
-                        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)), 8, 0, 2)
+                        C(imgui.ImVec4(1, 1, 1, (0.05 + hv * 0.07) * a)), SC(12), 0, SC(1))
                 end
 
                 local ts = imgui.CalcTextSize(tab.name)
-                local textCol = isSel and imgui.ImVec4(0.05, 0.05, 0.05, 1.0) or imgui.ImVec4(0.9, 0.9, 0.9, 1.0)
+                local textCol = isSel
+                    and imgui.ImVec4(0.07, 0.07, 0.08, 1.0)
+                    or  imgui.ImVec4(0.88, 0.91, 0.95, 1.0)
                 DL:AddText(imgui.ImVec2(tpos.x + tw / 2 - ts.x / 2, tpos.y + th / 2 - ts.y / 2),
-                    imgui.ColorConvertFloat4ToU32(textCol), tab.name)
+                    C(textCol), tab.name)
 
                 if imgui.IsItemClicked() then tabs.selected = key end
-                imgui.SetCursorPosY(imgui.GetCursorPosY() + 6)
+                imgui.SetCursorPosY(imgui.GetCursorPosY() + SC(8))
             end
         end
 
-        imgui.SetCursorPos(imgui.ImVec2(leftSize + 15, 15))
+        -- Версия внизу сайдбара
+        if FONT_SUB then
+            imgui.PushFont(FONT_SUB)
+            local vtxt = 'v' .. LOCAL_VERSION
+            local vts  = imgui.CalcTextSize(vtxt)
+            DL:AddText(imgui.ImVec2(pos.x + (leftSize - vts.x) / 2, pos.y + wsize.y - SC(30)),
+                C(imgui.ImVec4(0.40, 0.45, 0.53, a)), vtxt)
+            imgui.PopFont()
+        end
+
+        -- Контент
+        imgui.SetCursorPos(imgui.ImVec2(leftSize + SC(18), SC(16)))
         imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, windowAlpha * tabFade)
 
-        local contentW = math.max(100, wsize.x - leftSize - 30)
-        local contentH = math.max(100, wsize.y - 30)
+        local contentW = math.max(SC(100), wsize.x - leftSize - SC(36))
+        local contentH = math.max(SC(100), wsize.y - SC(32))
 
-        if imgui.BeginChild('content', imgui.ImVec2(contentW, contentH), true) then
+        imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(SC(18), SC(14)))
+        imgui.PushStyleColor(imgui.Col.ChildBg, imgui.ImVec4(1, 1, 1, 0.02))
+        if imgui.BeginChild('##hfj_content', imgui.ImVec2(contentW, contentH), false) then
             if tabSlide > 0 then imgui.SetCursorPosX(imgui.GetCursorPosX() + tabSlide) end
 
             local section, tabIdx = tabs.selected:match('(%d+):(%d+)')
@@ -1367,6 +1582,8 @@ local function GlassWindow(title, var, closeButton, leftSize, tabs, flags)
             end
         end
         imgui.EndChild()
+        imgui.PopStyleColor()
+        imgui.PopStyleVar()
         imgui.PopStyleVar()
         imgui.End()
     end
@@ -1381,6 +1598,14 @@ imgui.OnInitialize(function()
     pcall(function() imio.Fonts:Clear() end)
     local cyr_ranges = imio.Fonts:GetGlyphRangesCyrillic()
 
+    -- Масштаб интерфейса под разрешение экрана телефона (база - 1280 px)
+    local sw = 1280
+    pcall(function()
+        local w = getScreenResolution()
+        if w and w > 0 then sw = w end
+    end)
+    UI_SCALE = math.max(1.0, math.min(2.2, sw / 1280))
+
     local regular_paths = {
         '/system/fonts/Roboto-Regular.ttf',
         '/system/fonts/RobotoCondensed-Regular.ttf',
@@ -1394,58 +1619,43 @@ imgui.OnInitialize(function()
         '/system/fonts/Roboto-Black.ttf',
     }
 
-    local loaded = false
-    for _, path in ipairs(regular_paths) do
-        local fh = io.open(path, 'r')
-        if fh then
-            fh:close()
-            local ok, font = pcall(function() return imio.Fonts:AddFontFromFileTTF(path, 20, nil, cyr_ranges) end)
-            if ok and font then imio.FontDefault = font; loaded = true; break end
+    local function loadFont(paths, size)
+        for _, path in ipairs(paths) do
+            local fh = io.open(path, 'r')
+            if fh then
+                fh:close()
+                local ok, font = pcall(function()
+                    return imio.Fonts:AddFontFromFileTTF(path, size, nil, cyr_ranges)
+                end)
+                if ok and font then return font end
+            end
         end
+        return nil
     end
-    if not loaded then pcall(function() imio.Fonts:AddFontDefault() end) end
 
-    for _, path in ipairs(bold_paths) do
-        local fh = io.open(path, 'r')
-        if fh then
-            fh:close()
-            local ok, font = pcall(function() return imio.Fonts:AddFontFromFileTTF(path, 30, nil, cyr_ranges) end)
-            if ok and font then FONT_LOGO = font; break end
-        end
+    local def = loadFont(regular_paths, SC(20))
+    if not def then
+        local ok, font = pcall(function() return imio.Fonts:AddFontDefault() end)
+        if ok and font then def = font end
     end
-    if not FONT_LOGO then FONT_LOGO = imio.FontDefault end
+    if def then imio.FontDefault = def end
 
-    for _, path in ipairs(regular_paths) do
-        local fh = io.open(path, 'r')
-        if fh then
-            fh:close()
-            local ok, font = pcall(function() return imio.Fonts:AddFontFromFileTTF(path, 16, nil, cyr_ranges) end)
-            if ok and font then FONT_SUB = font; break end
-        end
-    end
-    if not FONT_SUB then FONT_SUB = imio.FontDefault end
-
-    for _, path in ipairs(bold_paths) do
-        local fh = io.open(path, 'r')
-        if fh then
-            fh:close()
-            local ok, font = pcall(function() return imio.Fonts:AddFontFromFileTTF(path, 28, nil, cyr_ranges) end)
-            if ok and font then FONT_BIG = font; break end
-        end
-    end
-    if not FONT_BIG then FONT_BIG = FONT_LOGO end
+    FONT_LOGO = loadFont(bold_paths, SC(30)) or def
+    FONT_SUB  = loadFont(regular_paths, SC(16)) or def
+    FONT_BIG  = loadFont(bold_paths, SC(28)) or FONT_LOGO
 
     local style = imgui.GetStyle()
     style.WindowPadding     = imgui.ImVec2(0, 0)
-    style.WindowRounding    = 12
-    style.ChildRounding     = 10
-    style.FrameRounding     = 5
-    style.PopupRounding     = 8
-    style.ScrollbarRounding = 8
-    style.GrabRounding      = 5
-    style.ItemSpacing       = imgui.ImVec2(10, 10)
-    style.ItemInnerSpacing  = imgui.ImVec2(8, 8)
-    style.FramePadding      = imgui.ImVec2(10, 8)
+    style.WindowRounding    = SC(18)
+    style.ChildRounding     = SC(14)
+    style.FrameRounding     = SC(10)
+    style.PopupRounding     = SC(10)
+    style.ScrollbarRounding = SC(10)
+    style.GrabRounding      = SC(8)
+    style.ItemSpacing       = imgui.ImVec2(SC(10), SC(10))
+    style.ItemInnerSpacing  = imgui.ImVec2(SC(8), SC(8))
+    style.FramePadding      = imgui.ImVec2(SC(10), SC(8))
+    style.ScrollbarSize     = SC(12)
     style.WindowBorderSize  = 0
 
     local col = style.Colors
@@ -1481,99 +1691,93 @@ local function OrdersTabFrame()
     if math.abs(statDispOrders - CFG.ordersDone) < 0.01 then statDispOrders = CFG.ordersDone end
     if math.abs(statDispMoney  - CFG.moneyEarned) < 0.5 then statDispMoney  = CFG.moneyEarned end
 
+    -- Сдвиг контента при переключении таба (анимация)
+    local slide = imgui.GetCursorPosX()
+    imgui.SetCursorPos(imgui.ImVec2(0, SC(6)))
     local avail  = imgui.GetContentRegionAvail()
-    local panelH = math.max(380, avail.y - 20)
-    local w1     = math.min(380, avail.x * 0.45)
-    local w2     = math.max(150, avail.x - w1 - 20)
+    local panelH = math.max(SC(380), avail.y)
+    local w1     = math.min(SC(370), avail.x * 0.44)
+    local w2     = math.max(SC(180), avail.x - w1 - SC(16))
 
-    imgui.SetCursorPos(imgui.ImVec2(0, 10))
+    -- Текущее состояние ловли
+    local stxt, scol
+    if pendingAccept then
+        stxt, scol = L'Ожидаем метку', COL.accent
+    elseif tapSequenceActive then
+        stxt, scol = L'Перебор #' .. tapSeqIndex, COL.orange
+    elseif hasActiveOrder then
+        stxt, scol = L'В заказе', COL.green
+    elseif awaitingDialog then
+        stxt, scol = L'Ждём диалог', COL.accent
+    else
+        stxt, scol = L'Ожидание', COL.dim
+    end
+
+    imgui.SetCursorPos(imgui.ImVec2(slide, SC(6)))
     GlassChild(u8(L'Автоловля'), imgui.ImVec2(w1, panelH), function()
-        local c = new.bool(CFG.catchEnabled)
-        if ToggleButton(u8(L'Ловить заказы'), c, 0.2) then
-            CFG.catchEnabled = c[0]; buf.catchEnabled[0] = c[0]; markDirty()
+        tgCatch[0] = CFG.catchEnabled
+        if ToggleButton(u8(L'Ловить заказы'), tgCatch, 0.18) then
+            CFG.catchEnabled = tgCatch[0]; buf.catchEnabled[0] = CFG.catchEnabled; markDirty()
         end
-        imgui.Spacing(); imgui.Spacing()
-        local a = new.bool(CFG.autoAccept)
-        if ToggleButton(u8(L'Авто-принять заказ'), a, 0.2) then
-            CFG.autoAccept = a[0]; buf.autoAccept[0] = a[0]; markDirty()
+        imgui.Spacing()
+        tgAccept[0] = CFG.autoAccept
+        if ToggleButton(u8(L'Авто-принять заказ'), tgAccept, 0.18) then
+            CFG.autoAccept = tgAccept[0]; buf.autoAccept[0] = CFG.autoAccept; markDirty()
         end
 
-        imgui.Spacing()
-        imgui.Separator()
-        imgui.Spacing()
+        imgui.Spacing(); Divider(); imgui.Spacing()
 
-        if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Ловля через диалоги и чат.'))
-        imgui.TextWrapped(u8(L'Платёжные окна не трогаются автоматически.'))
-        if FONT_SUB then imgui.PopFont() end
+        Label(u8(L'Состояние'))
+        Pill(u8(stxt), scol)
+
+        imgui.Spacing()
+        Label(u8(L'Ловля через диалоги и чат.'))
+        Label(u8(L'Платёжные окна не трогаются.'))
     end)
 
-    imgui.SetCursorPos(imgui.ImVec2(w1 + 15, 10))
+    imgui.SetCursorPos(imgui.ImVec2(slide + w1 + SC(16), SC(6)))
     GlassChild(u8(L'Статистика'), imgui.ImVec2(w2, panelH), function()
-        if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Заказов выполнено'))
-        if FONT_SUB then imgui.PopFont() end
-
-        if FONT_BIG then imgui.PushFont(FONT_BIG) end
-        imgui.TextColored(imgui.ImVec4(1.0, 0.78, 0.05, 1), tostring(math.floor(statDispOrders + 0.5)))
-        if FONT_BIG then imgui.PopFont() end
+        Label(u8(L'Заказов выполнено'))
+        BigValue(tostring(math.floor(statDispOrders + 0.5)))
 
         imgui.Spacing()
+        Label(u8(L'Заработано'))
+        BigValue('$' .. zpFormatMoney(statDispMoney + 0.5))
+
+        imgui.Spacing(); Divider(); imgui.Spacing()
+
+        Label(u8(L'Статус'))
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Заработано'))
+        imgui.TextColored(scol, u8(stxt))
         if FONT_SUB then imgui.PopFont() end
 
-        if FONT_BIG then imgui.PushFont(FONT_BIG) end
-        imgui.TextColored(imgui.ImVec4(1.0, 0.78, 0.05, 1), '$' .. zpFormatMoney(statDispMoney + 0.5))
-        if FONT_BIG then imgui.PopFont() end
+        imgui.Spacing(); Divider(); imgui.Spacing()
 
-        imgui.Spacing()
-        imgui.Separator()
-        imgui.Spacing()
+        if updateDownloading then
+            Label(u8(L'Идёт проверка/скачивание...'))
+            imgui.Spacing()
+        end
 
-        if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Статус:'))
-        if FONT_SUB then imgui.PopFont() end
-
-        if pendingAccept then
-            imgui.TextColored(imgui.ImVec4(1, 0.7, 0.2, 1), u8(L'Ожидаем метку'))
-        elseif tapSequenceActive then
-            imgui.TextColored(imgui.ImVec4(1, 0.7, 0.2, 1), u8(L'Перебор: #') .. tapSeqIndex)
-        elseif hasActiveOrder then
-            imgui.TextColored(imgui.ImVec4(1, 0.7, 0.2, 1), u8(L'В заказе'))
-        elseif awaitingDialog then
-            imgui.TextColored(imgui.ImVec4(1, 0.7, 0.2, 1), u8(L'Ждём диалог'))
-        else
-            imgui.TextColored(imgui.ImVec4(0.55, 0.62, 0.70, 1), u8(L'Ожидание'))
+        local updLabel = updateAvailable
+            and (u8(L'Обновить до ') .. u8(remoteVersion))
+            or  u8(L'Проверить обновления')
+        if AccentButton(updLabel, SC(50), updateAvailable) then
+            if updateAvailable then doUpdate() else doCheck() end
         end
 
         imgui.Spacing()
-        imgui.Separator()
-        imgui.Spacing()
-
-        if imgui.Button(u8(L'Сбросить статистику'), imgui.ImVec2(-1, 38)) then
+        if AccentButton(u8(L'Сбросить статистику'), SC(46)) then
             resetAllStats(); notify(L'Статистика сброшена')
         end
         imgui.Spacing()
-        if imgui.Button(u8(L'Сброс заказа'), imgui.ImVec2(-1, 38)) then
+        if AccentButton(u8(L'Сброс заказа'), SC(46)) then
             finishOrder('manual')
         end
+
         imgui.Spacing()
-        if updateDownloading then
-            imgui.TextColored(imgui.ImVec4(1, 0.7, 0.2, 1), u8(L'Идёт проверка/скачивание...')); imgui.Spacing()
-        end
-        if updateAvailable then
-            if imgui.Button(u8(L'Обновить до ') .. u8(remoteVersion), imgui.ImVec2(-1, 38)) then doUpdate() end
-        else
-            if imgui.Button(u8(L'Проверить обновления'), imgui.ImVec2(-1, 38)) then doCheck() end
-        end
-        imgui.Spacing()
+        Label(u8(L'Версия: ') .. LOCAL_VERSION)
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        imgui.TextColored(imgui.ImVec4(0.55, 0.62, 0.70, 1), u8(L'Версия: ') .. LOCAL_VERSION)
-        local statusCol = updateAvailable
-            and imgui.ImVec4(1.0, 0.78, 0.05, 1)
-            or  imgui.ImVec4(0.55, 0.62, 0.70, 1)
-        imgui.TextColored(statusCol, u8(L'Обновление: ') .. u8(updaterStatus))
+        imgui.TextColored(updateAvailable and COL.accent or COL.dim, u8(updaterStatus))
         if FONT_SUB then imgui.PopFont() end
     end)
 end
@@ -1588,105 +1792,107 @@ local ZP_JOB_LIST = {
 }
 
 local function ZpTabFrame()
+    local slide = imgui.GetCursorPosX()
+    imgui.SetCursorPos(imgui.ImVec2(0, SC(6)))
     local avail  = imgui.GetContentRegionAvail()
-    local panelH = math.max(380, avail.y - 20)
-    local w1     = math.min(420, avail.x * 0.5)
-    local w2     = math.max(150, avail.x - w1 - 20)
+    local panelH = math.max(SC(380), avail.y)
+    local w1     = math.min(SC(400), avail.x * 0.5)
+    local w2     = math.max(SC(180), avail.x - w1 - SC(16))
 
-    imgui.SetCursorPos(imgui.ImVec2(0, 10))
+    imgui.SetCursorPos(imgui.ImVec2(slide, SC(6)))
     GlassChild(u8(L'Выплаты по работам'), imgui.ImVec2(w1, panelH), function()
         for i, job in ipairs(ZP_JOB_LIST) do
-            if FONT_SUB then imgui.PushFont(FONT_SUB) end
-            imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(job.label))
-            if FONT_SUB then imgui.PopFont() end
-
-            if FONT_BIG then imgui.PushFont(FONT_BIG) end
-            imgui.TextColored(imgui.ImVec4(1.0, 0.78, 0.05, 1), '$' .. zpFormatMoney(ZP[job.key]))
-            if FONT_BIG then imgui.PopFont() end
-
-            if i < #ZP_JOB_LIST then imgui.Spacing(); imgui.Separator(); imgui.Spacing() end
+            Label(u8(job.label))
+            BigValue('$' .. zpFormatMoney(ZP[job.key]))
+            if i < #ZP_JOB_LIST then imgui.Spacing(); Divider(); imgui.Spacing() end
         end
     end)
 
-    imgui.SetCursorPos(imgui.ImVec2(w1 + 15, 10))
+    imgui.SetCursorPos(imgui.ImVec2(slide + w1 + SC(16), SC(6)))
     GlassChild(u8(L'Итого и дистанция'), imgui.ImVec2(w2, panelH), function()
+        Label(u8(L'Всего по работам'))
+        BigValue('$' .. zpFormatMoney(zpTotal()))
+
+        imgui.Spacing(); Divider(); imgui.Spacing()
+
+        Label(u8(L'Проехано от выплаты'))
+        local frac = ZP_MOVE_THRESHOLD > 0 and (zpMovedDist / ZP_MOVE_THRESHOLD) or 0
+        ProgressBar(frac, SC(12), COL.accent)
+
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Всего по работам'))
-        if FONT_SUB then imgui.PopFont() end
-
-        if FONT_BIG then imgui.PushFont(FONT_BIG) end
-        imgui.TextColored(imgui.ImVec4(1.0, 0.78, 0.05, 1), '$' .. zpFormatMoney(zpTotal()))
-        if FONT_BIG then imgui.PopFont() end
-
-        imgui.Spacing(); imgui.Separator(); imgui.Spacing()
-
-        if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Проехано от выплаты:'))
-        imgui.TextColored(imgui.ImVec4(0.95, 0.96, 0.98, 1),
-            string.format(u8(L'%d / %d м'), math.floor(zpMovedDist), math.floor(ZP_MOVE_THRESHOLD)))
+        imgui.TextColored(COL.text, string.format(u8(L'%d / %d м'),
+            math.floor(zpMovedDist), math.floor(ZP_MOVE_THRESHOLD)))
         imgui.TextWrapped(u8(L'Выплата засчитывается только после реального проезда.'))
         if FONT_SUB then imgui.PopFont() end
 
-        imgui.Spacing(); imgui.Separator(); imgui.Spacing()
+        imgui.Spacing(); Divider(); imgui.Spacing()
 
-        if imgui.Button(u8(L'Сбросить ЗП'), imgui.ImVec2(-1, 38)) then
+        if AccentButton(u8(L'Сбросить ЗП'), SC(46)) then
             ZP.taxi, ZP.trucker, ZP.collector = 0, 0, 0
             markDirty(); saveCfg(); notify(L'Счётчик ЗП сброшен')
         end
         imgui.Spacing()
-        if imgui.Button(u8(L'Сбросить всё'), imgui.ImVec2(-1, 38)) then
+        if AccentButton(u8(L'Сбросить всё'), SC(46)) then
             resetAllStats(); notify(L'Вся статистика сброшена')
         end
     end)
 end
 
 -- ============================================================
---  ТАБ: ИНФО (Крупный текст)
+--  ТАБ: ИНФО
 -- ============================================================
 local function InfoTabFrame()
+    local slide = imgui.GetCursorPosX()
+    imgui.SetCursorPos(imgui.ImVec2(0, SC(6)))
     local avail  = imgui.GetContentRegionAvail()
-    local panelW = math.max(150, avail.x)
-    local panelH = math.max(380, avail.y - 20)
+    local panelH = math.max(SC(380), avail.y)
+    local w1     = math.min(SC(430), avail.x * 0.5)
+    local w2     = math.max(SC(220), avail.x - w1 - SC(16))
 
-    imgui.SetCursorPos(imgui.ImVec2(0, 10))
-    GlassChild(u8(L'О программе'), imgui.ImVec2(panelW, panelH), function()
-        if FONT_BIG then imgui.PushFont(FONT_BIG) end
-        
-        imgui.TextColored(imgui.ImVec4(1.0, 0.78, 0.05, 1), 'TAXORD ' .. VERSION)
-        
-        imgui.Spacing(); imgui.Separator(); imgui.Spacing()
+    imgui.SetCursorPos(imgui.ImVec2(slide, SC(6)))
+    GlassChild(u8(L'О программе'), imgui.ImVec2(w1, panelH), function()
+        BigValue('Help for Job')
+        Label('HfJ  ·  v' .. VERSION)
 
-        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Автоловля заказов + счётчик зарплаты'))
+        imgui.Spacing(); Divider(); imgui.Spacing()
 
-        imgui.Spacing(); imgui.Spacing()
-
-        imgui.PushTextWrapPos(math.max(50, imgui.GetCursorPos().x + panelW - 60))
-        imgui.TextWrapped(u8(L'Ловит заказы двумя способами: через диалоги сервера и через чат.'))
+        if FONT_SUB then imgui.PushFont(FONT_SUB) end
+        imgui.TextWrapped(u8(L'Автоловля заказов + счётчик зарплаты по работам.'))
         imgui.Spacing()
-        imgui.TextWrapped(u8(L'Диалоги с оплатой (:CASH:) не нажимает автоматически.'))
+        imgui.TextWrapped(u8(L'Ловит заказы двумя способами: через диалоги сервера и через чат. Диалоги с оплатой (:CASH:) не нажимает автоматически.'))
         imgui.Spacing()
-        imgui.TextWrapped(u8(L'Счётчик ЗП считает выплаты по работам (такси, дальнобойщик, инкассатор) и учитывает их только после реального проезда.'))
+        imgui.TextWrapped(u8(L'Счётчик ЗП учитывает выплаты по работам (такси, дальнобойщик, инкассатор) только после реального проезда.'))
         imgui.Spacing()
-        imgui.TextWrapped(u8(L'Обновление: проверка версии с GitHub, загрузка новой версии одной кнопкой.'))
-        imgui.PopTextWrapPos()
+        imgui.TextWrapped(u8(L'Обновление: проверка версии с GitHub и установка одной кнопкой.'))
+        if FONT_SUB then imgui.PopFont() end
+    end)
 
-        imgui.Spacing(); imgui.Spacing()
+    imgui.SetCursorPos(imgui.ImVec2(slide + w1 + SC(16), SC(6)))
+    GlassChild(u8(L'Команды'), imgui.ImVec2(w2, panelH), function()
+        local cmds = {
+            { '/hfj',       L'меню' },
+            { '/zarabotok', L'статистика (окно)' },
+            { '/resetstat', L'сброс статистики' },
+            { '/checkupd',  L'проверить обновление' },
+            { '/update',    L'скачать обновление' },
+            { '/updinfo',   L'диагностика обновления' },
+        }
+        for i, cm in ipairs(cmds) do
+            if FONT_SUB then imgui.PushFont(FONT_SUB) end
+            imgui.TextColored(COL.accent, u8(cm[1]))
+            imgui.TextColored(COL.dim, u8(cm[2]))
+            if FONT_SUB then imgui.PopFont() end
+            if i < #cmds then imgui.Spacing() end
+        end
 
-        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Команды:'))
-        imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/taxord    - меню'))
-        imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/zarabotok - статистика (окно)'))
-        imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/resetstat - сброс статистики'))
-        imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/checkupd  - проверить обновление'))
-        imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/update    - скачать обновление'))
-        imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/updinfo   - диагностика обновления'))
-
-        if FONT_BIG then imgui.PopFont() end
+        imgui.Spacing(); Divider(); imgui.Spacing()
+        Label(u8(L'Старый алиас: /taxord'))
     end)
 end
 
 tabsList.tabs = {
     {
-        name = 'TAXORD',
+        name = 'HfJ',
         list = {
             { name = u8(L'Заказы'), icon = '', frame = OrdersTabFrame },
             { name = u8(L'ЗП'),     icon = '', frame = ZpTabFrame     },
@@ -1712,15 +1918,15 @@ imgui.OnFrame(
         end
 
         if tabsList.selected ~= lastSelectedTab then
-            tabFade = 0; tabSlide = 50; lastSelectedTab = tabsList.selected
+            tabFade = 0; tabSlide = SC(60); lastSelectedTab = tabsList.selected
         end
         if tabFade < 1 then tabFade = math.min(1, tabFade + 0.075) end
         if tabSlide > 0 then
-            tabSlide = tabSlide - 4.5
+            tabSlide = tabSlide - SC(5)
             if tabSlide < 0 then tabSlide = 0 end
         end
 
-        GlassWindow('TaxordMenu', window, true, 240, tabsList, imgui.WindowFlags.NoCollapse)
+        GlassWindow('HfJMenu', window, true, SC(268), tabsList, imgui.WindowFlags.NoCollapse)
     end
 )
 
@@ -1774,13 +1980,13 @@ imgui.OnFrame(
 
         local text = u8(sn.message)
         local ts   = imgui.CalcTextSize(text)
-        local pad_x = 80
-        local pad_y = 24
-        local iconSize = 48
-        local w_px = math.min(sw - 40, ts.x + pad_x * 2 + iconSize)
-        local h_px = math.max(76, ts.y + pad_y * 2)
+        local pad_x = SC(66)
+        local pad_y = SC(20)
+        local iconSize = SC(44)
+        local w_px = math.min(sw - SC(40), ts.x + pad_x * 2 + iconSize)
+        local h_px = math.max(SC(74), ts.y + pad_y * 2)
 
-        local w_pos = imgui.ImVec2(sw / 2, sh - sn.anim * (h_px + 20) - 10)
+        local w_pos = imgui.ImVec2(sw / 2, sh - sn.anim * (h_px + SC(20)) - SC(10))
 
         imgui.SetNextWindowPos(w_pos, imgui.Cond.Always, imgui.ImVec2(0.5, 0.0))
         imgui.SetNextWindowSize(imgui.ImVec2(w_px, h_px), imgui.Cond.Always)
@@ -1790,7 +1996,7 @@ imgui.OnFrame(
         imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(0, 0))
         imgui.PushStyleColor(imgui.Col.WindowBg, imgui.ImVec4(0, 0, 0, 0))
 
-        imgui.Begin('##TaxordToast', nil, imgui.WindowFlags.NoMove + imgui.WindowFlags.NoDecoration + imgui.WindowFlags.NoInputs)
+        imgui.Begin('##HfJToast', nil, imgui.WindowFlags.NoMove + imgui.WindowFlags.NoDecoration + imgui.WindowFlags.NoInputs)
 
         local p  = imgui.GetCursorScreenPos()
         local DL = imgui.GetWindowDrawList()
@@ -1800,23 +2006,23 @@ imgui.OnFrame(
 
         do
             local g = sn.glow * sn.anim
-            DL:AddRectFilled(imgui.ImVec2(A.x - 4, A.y - 4), imgui.ImVec2(B.x + 4, B.y + 4),
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.25 * g)), 18)
+            DL:AddRectFilled(imgui.ImVec2(A.x - SC(4), A.y - SC(4)), imgui.ImVec2(B.x + SC(4), B.y + SC(4)),
+                C(imgui.ImVec4(1.0, 0.78, 0.05, 0.25 * g)), SC(20))
         end
 
-        local bg = imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.09, 0.08, 0.05, 0.95))
+        local bg = C(imgui.ImVec4(0.09, 0.08, 0.05, 0.95))
         DL:PathClear()
         DL:PathArcTo(imgui.ImVec2(A.x + r, A.y + r), r, math.rad(90),  math.rad(270), 50)
         DL:PathArcTo(imgui.ImVec2(B.x - r, B.y - r), r, math.rad(-90), math.rad(90),  50)
         DL:PathFillConvex(bg)
 
-        local ac = imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 1.0))
-        DL:AddRectFilled(imgui.ImVec2(A.x + 12, A.y + 14), imgui.ImVec2(A.x + 18, B.y - 14), ac, 2)
+        local ac = C(imgui.ImVec4(1.0, 0.78, 0.05, 1.0))
+        DL:AddRectFilled(imgui.ImVec2(A.x + SC(12), A.y + SC(14)), imgui.ImVec2(A.x + SC(18), B.y - SC(14)), ac, SC(2))
 
         do
-            local icx = A.x + 48
+            local icx = A.x + SC(44)
             local icy = A.y + h_px / 2
-            local ir  = 18
+            local ir  = SC(17)
 
             local iconColor = imgui.ImVec4(0.15, 0.15, 0.15, 1)
             local iconBg    = imgui.ImVec4(1.0, 0.78, 0.05, 1)
@@ -1831,25 +2037,24 @@ imgui.OnFrame(
             end
 
             local g = sn.glow
-            DL:AddCircleFilled(imgui.ImVec2(icx, icy), ir + 6 + g * 3,
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(iconBg.x, iconBg.y, iconBg.z, 0.25 * g)))
-            DL:AddCircleFilled(imgui.ImVec2(icx, icy), ir, imgui.ColorConvertFloat4ToU32(iconBg))
+            DL:AddCircleFilled(imgui.ImVec2(icx, icy), ir + SC(6) + g * SC(3),
+                C(imgui.ImVec4(iconBg.x, iconBg.y, iconBg.z, 0.25 * g)))
+            DL:AddCircleFilled(imgui.ImVec2(icx, icy), ir, C(iconBg))
 
             if FONT_BIG then imgui.PushFont(FONT_BIG) end
             local its = imgui.CalcTextSize(iconChar)
-            DL:AddText(imgui.ImVec2(icx - its.x / 2, icy - its.y / 2 - 2),
-                imgui.ColorConvertFloat4ToU32(iconColor), iconChar)
+            DL:AddText(imgui.ImVec2(icx - its.x / 2, icy - its.y / 2 - SC(2)), C(iconColor), iconChar)
             if FONT_BIG then imgui.PopFont() end
         end
 
-        imgui.SetCursorPos(imgui.ImVec2(pad_x + 20, (h_px - ts.y) / 2))
+        imgui.SetCursorPos(imgui.ImVec2(pad_x + SC(18), (h_px - ts.y) / 2))
         imgui.TextColored(imgui.ImVec4(1, 1, 1, 1), text)
 
         do
-            local progressW = (B.x - A.x - 20) * (1 - math.min(1, (os.clock() - sn.timer) / NOTIFY_DURATION))
+            local progressW = (B.x - A.x - SC(20)) * (1 - math.min(1, (os.clock() - sn.timer) / NOTIFY_DURATION))
             if progressW > 0 then
-                DL:AddRectFilled(imgui.ImVec2(A.x + 12, B.y - 4), imgui.ImVec2(A.x + 12 + progressW, B.y - 2),
-                    imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.7)), 1)
+                DL:AddRectFilled(imgui.ImVec2(A.x + SC(12), B.y - SC(4)), imgui.ImVec2(A.x + SC(12) + progressW, B.y - SC(2)),
+                    C(imgui.ImVec4(1.0, 0.78, 0.05, 0.7)), SC(1))
             end
         end
 
@@ -1869,7 +2074,16 @@ function main()
     loadCfg()
     logAct('Script loaded. v' .. VERSION .. ' (utf8_file=' .. tostring(FILE_IS_UTF8) .. ')')
 
-    sampRegisterChatCommand('taxord', function()
+    sampRegisterChatCommand('hfj', function()
+        if window[0] then
+            window[0] = false
+        else
+            window[0] = true; windowRendering = true; windowAlpha = 0
+            tabFade = 1; tabSlide = 0; lastSelectedTab = tabsList.selected
+        end
+        logAct('Menu: ' .. tostring(window[0]))
+    end)
+    sampRegisterChatCommand('taxord', function()   -- старый алиас
         if window[0] then
             window[0] = false
         else
@@ -1897,7 +2111,7 @@ function main()
         notify(L'Статус: ' .. updaterStatus, 0xFFFF00)
     end)
 
-    notify(L'TaxOrd ' .. VERSION .. L' загружен, /taxord - меню', 0x00FF00)
+    notify(L'Help for Job ' .. VERSION .. L' загружен, /hfj - меню', 0x00FF00)
     startUpdateCheck()
 
     lua_thread.create(function()
@@ -1929,7 +2143,7 @@ function main()
             end
             if not busy then
                 local shown = sampShowDialog(UPDATE_DIALOG_ID,
-                    L'Обновление TaxOrd',
+                    L'Обновление Help for Job',
                     string.format(L'Доступна версия: %s\nУ вас установлена: %s\n\nОбновить скрипт сейчас?',
                         remoteVersion, LOCAL_VERSION),
                     L'Обновить', L'Позже', 0)
