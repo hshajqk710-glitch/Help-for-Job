@@ -1,11 +1,9 @@
--- taxord.lua
--- MonetLoader 3.8.x
--- v28.0.8 - ловля заказов через диалоги + чат, автоопределение кодировки,
---           обновлятор: кнопка проверки версии + загрузка обновления
--- СОХРАНЯЙ В ЛЮБОЙ КОДИРОВКЕ - скрипт сам определит
+-- Helper_for_earning_money.lua
+-- MonetLoader 3.8.x / MoonLoader
+-- v28.3.0
 
 script_name('TaxOrd')
-script_version('28.0.8')
+script_version('28.3.0')
 
 local imgui    = require 'mimgui'
 local new      = imgui.new
@@ -14,10 +12,13 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local sampev = require 'samp.events'
 
+local VERSION       = '28.3.0'
+local LOCAL_VERSION = VERSION
+
 -- ============================================================
 --  АВТООПРЕДЕЛЕНИЕ КОДИРОВКИ ФАЙЛА
 -- ============================================================
-local CANARY = 'Такси' -- длина этой строки зависит от кодировки файла
+local CANARY = 'Такси'
 local FILE_IS_UTF8 = (#CANARY > 5)
 
 local function utf8ToCp1251(s)
@@ -46,7 +47,6 @@ local function utf8ToCp1251(s)
     return table.concat(out)
 end
 
--- L() приводит любую русскую строку к CP1251 независимо от кодировки файла
 local function L(s)
     if FILE_IS_UTF8 then return utf8ToCp1251(s) end
     return s
@@ -82,6 +82,10 @@ local FONT_SUB     = nil
 local FONT_BIG     = nil
 local window       = new.bool(false)
 
+-- Переменные для перетаскивания окна без вылетов
+local winPos     = nil
+local winPosInit = false
+
 local windowAlpha     = 0
 local windowRendering = false
 local tabFade         = 1
@@ -94,7 +98,7 @@ local statDispMoney   = 0
 local statInit        = false
 
 -- ============================================================
---  НОРМАЛИЗАЦИЯ СТРОК (CP1251, байтовые классы)
+--  НОРМАЛИЗАЦИЯ СТРОК
 -- ============================================================
 local UPPER_CLASS  = '[' .. string.char(0xC0) .. '-' .. string.char(0xDE) .. ']'
 local CP_YO_UPPER  = string.char(0xA8)
@@ -112,7 +116,7 @@ local function normalize(s)
 end
 
 -- ============================================================
---  ПУТИ
+--  ПУТИ И ЛОГ
 -- ============================================================
 local WORK_DIR    = getWorkingDirectory()
 local CONFIG_DIR  = WORK_DIR .. '/config'
@@ -123,9 +127,6 @@ local LOG_FILE    = LOG_DIR .. '/taxord.log'
 if not doesDirectoryExist(CONFIG_DIR) then pcall(createDirectory, CONFIG_DIR) end
 if not doesDirectoryExist(LOG_DIR)    then pcall(createDirectory, LOG_DIR)    end
 
--- ============================================================
---  ЛОГ (всё пишется в UTF-8, чтобы читался нормально)
--- ============================================================
 local function logRaw(msg)
     print('[TaxOrd] ' .. msg)
     local f = io.open(LOG_FILE, 'a')
@@ -138,14 +139,14 @@ local function logRaw(msg)
 end
 local function logInit()
     local f = io.open(LOG_FILE, 'w')
-    if f then f:write('=== TaxOrd v28.0.8 ' .. os.date() .. ' ===\n'); f:close() end
+    if f then f:write('=== TaxOrd v' .. VERSION .. ' ' .. os.date() .. ' ===\n'); f:close() end
 end
 local function logChat(t) logRaw('CHAT  | ' .. tostring(t)) end
 local function logAct(t)  logRaw('ACT   | ' .. tostring(t)) end
 local function logDlg(t)  logRaw('DLG   | ' .. tostring(t)) end
 
 -- ============================================================
---  КОНФИГ
+--  КОНФИГ И СТАТИСТИКА
 -- ============================================================
 local CFG = {
     catchEnabled = true,
@@ -153,6 +154,11 @@ local CFG = {
     ordersDone   = 0,
     moneyEarned  = 0,
 }
+
+local ZP = { taxi = 0, trucker = 0, collector = 0 }
+local zpLastX, zpLastY, zpLastZ = nil, nil, nil
+local zpMovedDist = 0.0
+local ZP_MOVE_THRESHOLD = 50.0
 
 local buf = {
     catchEnabled = new.bool(true),
@@ -181,6 +187,9 @@ local function saveCfg()
     f:write('autoAccept='   .. tostring(CFG.autoAccept)   .. '\n')
     f:write('ordersDone='   .. tostring(CFG.ordersDone)   .. '\n')
     f:write('moneyEarned='  .. tostring(CFG.moneyEarned)  .. '\n')
+    f:write('zpTaxi='       .. tostring(math.floor(ZP.taxi))      .. '\n')
+    f:write('zpTrucker='    .. tostring(math.floor(ZP.trucker))   .. '\n')
+    f:write('zpCollector='  .. tostring(math.floor(ZP.collector)) .. '\n')
     f:close()
     cfgDirty = false
     return true
@@ -195,12 +204,67 @@ local function loadCfg()
             local n = tonumber(v)
             if k == 'catchEnabled' then CFG.catchEnabled = (v == 'true') end
             if k == 'autoAccept'   then CFG.autoAccept   = (v == 'true') end
-            if k == 'ordersDone'  and n then CFG.ordersDone  = n end
-            if k == 'moneyEarned' and n then CFG.moneyEarned = n end
+            if k == 'ordersDone'   and n then CFG.ordersDone  = n end
+            if k == 'moneyEarned'  and n then CFG.moneyEarned = n end
+            if k == 'zpTaxi'       and n then ZP.taxi         = n end
+            if k == 'zpTrucker'    and n then ZP.trucker      = n end
+            if k == 'zpCollector'  and n then ZP.collector    = n end
         end
     end
     f:close()
     cfgToBuf()
+end
+
+local function zpFormatMoney(n)
+    n = math.floor(tonumber(n) or 0)
+    local s = tostring(n)
+    local sign = ''
+    if s:sub(1, 1) == '-' then
+        sign = '-'
+        s = s:sub(2)
+    end
+    local out = s:reverse():gsub('(%d%d%d)', '%1.'):reverse()
+    if out:sub(1, 1) == '.' then out = out:sub(2) end
+    return sign .. out
+end
+
+local function zpExtractMoney(text)
+    if not text or text == '' then return nil end
+    local raw = text:match('%$(%d[%d%.,]*)')
+    if raw then
+        local n = tonumber((raw:gsub('[%.,]', '')))
+        if n and n > 0 then return n end
+    end
+    local maxVal, cur, hasDigits = 0, 0, false
+    for i = 1, #text do
+        local b = string.byte(text, i)
+        if b and b >= 48 and b <= 57 then
+            cur = cur * 10 + (b - 48)
+            hasDigits = true
+        elseif b == 46 then
+        else
+            if hasDigits and cur > maxVal then maxVal = cur end
+            cur, hasDigits = 0, false
+        end
+    end
+    if hasDigits and cur > maxVal then maxVal = cur end
+    return maxVal > 0 and maxVal or nil
+end
+
+local function zpDetectJob(textN)
+    if textN:find(L'инкассатор', 1, true) then return 'collector' end
+    if textN:find(L'дальнобой', 1, true)
+       or textN:find(L'груз', 1, true)
+       or textN:find(L'гауз', 1, true) then return 'trucker' end
+    if textN:find(L'такси', 1, true) then return 'taxi' end
+    return nil
+end
+
+local function zpIsPayout(textN)
+    if textN:find(L'клиент оплатил', 1, true) then return true end
+    if textN:find(L'зарплата за рейс', 1, true) then return true end
+    if textN:find(L'получено за обслуживание', 1, true) then return true end
+    return false
 end
 
 -- ============================================================
@@ -274,40 +338,78 @@ end
 --  UPDATER
 -- ============================================================
 local SCRIPT_FILENAME = 'Helper_for_earning_money.lua'
-local LOCAL_VERSION   = '28.0.8'
+local GH_USER, GH_REPO, GH_BRANCH = 'hshajqk710-glitch', 'taxord', 'main'
 
-local UPDATE_URL_VERSION = 'https://raw.githubusercontent.com/hshajqk710-glitch/taxord/main/version.txt'
-local UPDATE_URL_SCRIPT  = 'https://raw.githubusercontent.com/hshajqk710-glitch/taxord/main/' .. SCRIPT_FILENAME
+local UPDATE_URL_VERSION = ('https://raw.githubusercontent.com/%s/%s/%s/version.txt')
+    :format(GH_USER, GH_REPO, GH_BRANCH)
+local UPDATE_URL_SCRIPT = ('https://raw.githubusercontent.com/%s/%s/%s/%s')
+    :format(GH_USER, GH_REPO, GH_BRANCH, SCRIPT_FILENAME)
 
-local updateAvailable   = false
-local updateDownloading = false
-local remoteVersion     = ''
+local UPDATE_DIALOG_ID   = 8889
+local AUTO_CHECK_DELAY   = 12          -- сек после загрузки скрипта
+local AUTO_CHECK_EVERY   = 30 * 60     -- сек между тихими проверками
+local DOWNLOAD_TIMEOUT   = 25          -- сек на одну попытку загрузки
+local MIN_SCRIPT_SIZE    = 20000       -- байт: защита от HTML/обрезки
 
--- MoonLoader (PC) умеет downloadUrlToFile, MonetLoader (Android) - только socket/ssl.
+local updateAvailable     = false
+local updateDownloading   = false
+local remoteVersion       = ''
+local updaterStatus       = L'не проверялось'
+local lastAutoCheck       = 0
+local pendingUpdatePrompt = false
+local promptRetryAt       = 0
+local promptedVersion     = nil
+
 local okMoon, moonlib = pcall(require, 'moonloader')
 local DS_END = 6
 if okMoon and moonlib and moonlib.download_status then
     DS_END = moonlib.download_status.STATUS_ENDDOWNLOADDATA
 end
 
+local okRequests, requestsLib = pcall(require, 'requests')
 local okHttp,  http  = pcall(require, 'socket.http')
-if not okHttp then http = nil end
-
 local okHttps, https = pcall(require, 'ssl.https')
-if not okHttps then https = nil end
 
 local hasRawDownload = (downloadUrlToFile ~= nil)
-local hasHttpFetch   = (http ~= nil)
-local canDownload    = hasRawDownload or hasHttpFetch
+local hasRequests    = (okRequests and requestsLib ~= nil)
+local hasSecureHttp  = (okHttps and https ~= nil)
 
-local function parseVer(s)
-    local a, b, c = tostring(s):match('(%d+)%.(%d+)%.(%d+)')
-    if not a then return nil end
-    return tonumber(a) * 1000000 + tonumber(b) * 1000 + tonumber(c)
+local canDownload = hasRawDownload or hasRequests or hasSecureHttp
+
+local function updaterTransportsText()
+    local list = {}
+    if hasRawDownload then list[#list + 1] = 'downloadUrlToFile' end
+    if hasRequests    then list[#list + 1] = 'requests' end
+    if hasSecureHttp  then list[#list + 1] = 'ssl.https' end
+    if okHttp and http then list[#list + 1] = 'socket.http' end
+    if #list == 0 then return 'нет' end
+    return table.concat(list, ', ')
+end
+
+local function urlNoCache(url)
+    return url .. (url:find('?', 1, true) and '&' or '?') .. 'nocache=' .. tostring(os.time())
+end
+
+-- Сравнение версий по частям: "28.0.10" больше, чем "28.0.9"
+local function verParts(s)
+    local t = {}
+    for p in tostring(s or ''):gmatch('%d+') do t[#t + 1] = tonumber(p) end
+    return t
+end
+
+local function verLt(a, b)
+    local pa, pb = verParts(a), verParts(b)
+    if #pa == 0 or #pb == 0 then return false end
+    for i = 1, math.max(#pa, #pb) do
+        local x, y = pa[i] or 0, pb[i] or 0
+        if x < y then return true end
+        if x > y then return false end
+    end
+    return false
 end
 
 local function readFile(path)
-    local f = io.open(path, 'r')
+    local f = io.open(path, 'rb')
     if not f then return nil end
     local content = f:read('*a')
     f:close()
@@ -322,9 +424,6 @@ local function writeFile(path, content)
     return true
 end
 
--- Загрузка через socket.http / ssl.https (MonetLoader)
--- ВАЖНО: ssl.https (LuaSec) не принимает поле redirect и сам редиректы не умеет,
--- поэтому redirect не передаём, а 3xx обрабатываем вручную.
 local function socketRequestOnce(url)
     local body = {}
     local sink = function(chunk)
@@ -353,16 +452,13 @@ local function socketRequestOnce(url)
 end
 
 local function socketFetch(url)
-    local current = url
-
+    local current = urlNoCache(url)
     for attempt = 1, 4 do
         local text, code, err, location = socketRequestOnce(current)
-
         if text then
             if text == '' then return nil, 'пустой ответ' end
             return text
         end
-
         if location and (code == 301 or code == 302 or code == 303 or code == 307) then
             if location:sub(1, 1) == '/' then
                 local schemeHost = current:match('^(https?://[^/]+)')
@@ -373,54 +469,68 @@ local function socketFetch(url)
             return nil, err or ('HTTP ' .. tostring(code))
         end
     end
-
     return nil, 'слишком много редиректов'
 end
 
--- Загрузка через downloadUrlToFile (PC MoonLoader)
-local function rawFetch(url)
-    local tmp = WORK_DIR .. '/update_tmp_version.txt'
+local function rawFetch(url, timeout)
+    local tmp = WORK_DIR .. '/taxord_upd_tmp.txt'
     os.remove(tmp)
-
     local finished = false
-    local ok = pcall(downloadUrlToFile, url, tmp, function(id, status)
+    local ok = pcall(downloadUrlToFile, urlNoCache(url), tmp, function(id, status)
         if status == DS_END then finished = true end
     end)
-    if not ok then return nil, 'downloadUrlToFile' end
-
+    if not ok then return nil, 'downloadUrlToFile недоступен' end
     local t0 = os.clock()
-    while not finished and (os.clock() - t0) < 15 do wait(0) end
-
-    local content = readFile(tmp)
+    while not finished and (os.clock() - t0) < (timeout or DOWNLOAD_TIMEOUT) do wait(0) end
+    local content = finished and readFile(tmp) or nil
     os.remove(tmp)
-    if not content or content == '' then return nil, 'пустой ответ' end
+    if not content or content == '' then return nil, 'таймаут downloadUrlToFile' end
     return content
 end
 
-local function fetchText(url)
+local function requestsFetch(url)
+    if not hasRequests then return nil, 'нет requests' end
+    local ok, resp = pcall(requestsLib.request, 'GET', urlNoCache(url))
+    if not ok or not resp then return nil, 'requests: ' .. tostring(resp) end
+    local code = tonumber(resp.status_code) or 0
+    if code ~= 200 then return nil, 'requests HTTP ' .. tostring(code) end
+    local body = resp.text or resp.content
+    if not body or body == '' then return nil, 'requests: пустой ответ' end
+    return body
+end
+
+local function fetchText(url, timeout)
+    local errors = {}
+
     if hasRawDownload then
-        local body, err = rawFetch(url)
+        local body, err = rawFetch(url, timeout)
         if body then return body end
+        errors[#errors + 1] = 'raw: ' .. tostring(err)
+        logAct('Fetch fail (downloadUrlToFile): ' .. tostring(err))
     end
-    if hasHttpFetch then
-        return socketFetch(url)
+    if hasRequests then
+        local body, err = requestsFetch(url)
+        if body then return body end
+        errors[#errors + 1] = 'requests: ' .. tostring(err)
+        logAct('Fetch fail (requests): ' .. tostring(err))
     end
-    return nil, 'нет транспорта'
+    if hasSecureHttp or (okHttp and http) then
+        local body, err = socketFetch(url)
+        if body then return body end
+        errors[#errors + 1] = 'socket: ' .. tostring(err)
+        logAct('Fetch fail (socket): ' .. tostring(err))
+    end
+
+    if #errors == 0 then return nil, 'нет транспорта' end
+    return nil, table.concat(errors, ' | ')
 end
 
 local function applyVersionText(text)
     local ver = tostring(text or ''):match('%d+%.%d+%.%d+')
     if not ver then return 'err' end
-    local r, l = parseVer(ver), parseVer(LOCAL_VERSION)
-    if not r or not l then return 'err' end
-    if r > l then
-        remoteVersion = ver
-        updateAvailable = true
-        return 'new'
-    end
     remoteVersion = ver
-    updateAvailable = false
-    return 'same'
+    updateAvailable = verLt(LOCAL_VERSION, ver)
+    return updateAvailable and 'new' or 'same'
 end
 
 local function scriptPath()
@@ -432,116 +542,193 @@ local function scriptPath()
     return WORK_DIR .. '/' .. SCRIPT_FILENAME
 end
 
-local function doCheck()
+local doCheck, doUpdate
+
+-- Ставим флаг, а сам диалог показываем из главного цикла (безопасно для mimgui/samp)
+local function promptUpdate()
+    if not updateAvailable then return end
+    if promptedVersion == remoteVersion then return end
+    promptedVersion = remoteVersion
+    pendingUpdatePrompt = true
+end
+
+doCheck = function(silent, thenDownload)
+    if updateDownloading then return end
     if not canDownload then
-        notify(L'Скачивание недоступно на этой сборке', 0xFF0000)
+        updaterStatus = L'нет http-транспорта'
+        logAct('Updater: no transport')
+        if not silent then
+            notify(L'Скачивание недоступно на этой сборке', 0xFF0000)
+        end
         return
     end
-    if updateDownloading then return end
+
     updateDownloading = true
-    notify(L'Проверяю обновление...', 0xFFFF00)
+    updaterStatus = L'проверяю...'
+    if not silent then notify(L'Проверяю обновление на GitHub...', 0xFFFF00) end
 
     lua_thread.create(function()
-        local body, err = fetchText(UPDATE_URL_VERSION)
+        local ok, body, err = pcall(fetchText, UPDATE_URL_VERSION, 15)
         updateDownloading = false
+        if not ok then body, err = nil, tostring(body) end
 
         if not body then
+            updaterStatus = L'ошибка проверки'
             logAct('Check failed: ' .. tostring(err))
-            notify(L'Не удалось проверить обновление', 0xFF0000)
+            if not silent then notify(L'Не удалось проверить обновление', 0xFF0000) end
             return
         end
 
         local st = applyVersionText(body)
         if st == 'new' then
-            notify(L'Доступна новая версия: ' .. remoteVersion, 0xFFAA00)
-            logAct('Update available: ' .. remoteVersion)
+            updaterStatus = L'доступно v' .. remoteVersion
+            logAct('Update available: v' .. remoteVersion .. ' (local v' .. LOCAL_VERSION .. ')')
+            -- не спамим одним и тем же предложением при тихих проверках
+            if not silent or promptedVersion ~= remoteVersion then
+                notify(L'Доступно обновление: v' .. remoteVersion, 0xFFAA00)
+            end
+            if thenDownload then doUpdate() else promptUpdate() end
         elseif st == 'same' then
-            notify(L'У вас последняя версия', 0x00FF00)
+            updaterStatus = L'последняя версия'
+            logAct('Check ok: up to date (v' .. LOCAL_VERSION .. ')')
+            if not silent then notify(L'У вас последняя версия: v' .. LOCAL_VERSION, 0x00FF00) end
         else
-            notify(L'Не удалось проверить обновление', 0xFF0000)
+            updaterStatus = L'неверный ответ'
+            logAct('Check failed: version.txt = ' .. tostring(body):sub(1, 120))
+            if not silent then notify(L'Не удалось проверить обновление', 0xFF0000) end
         end
     end)
 end
 
-local function doUpdate()
+doUpdate = function()
+    if updateDownloading then
+        notify(L'Уже идёт проверка или загрузка', 0xFFFF00)
+        return
+    end
     if not canDownload then
         notify(L'Скачивание недоступно на этой сборке', 0xFF0000)
         return
     end
     if not updateAvailable then
-        notify(L'Обновление не найдено - сначала /checkupd', 0xFFAA00)
+        notify(L'Обновлений нет - проверяю заново...', 0xFFFF00)
+        doCheck(true, true)
         return
     end
-    if updateDownloading then return end
+
     updateDownloading = true
-    notify(L'Идет скачивание обновления...', 0xFFFF00)
+    updaterStatus = L'скачиваю v' .. remoteVersion
+    notify(L'Скачиваю обновление v' .. remoteVersion .. '...', 0xFFFF00)
 
     lua_thread.create(function()
-        local body, err = fetchText(UPDATE_URL_SCRIPT)
+        local ok, body, err = pcall(fetchText, UPDATE_URL_SCRIPT, DOWNLOAD_TIMEOUT)
         updateDownloading = false
+        if not ok then body, err = nil, tostring(body) end
 
         if not body or body == '' then
+            updaterStatus = L'ошибка загрузки'
             logAct('Download failed: ' .. tostring(err))
             notify(L'Ошибка скачивания обновления', 0xFF0000)
             return
         end
 
-        -- защита от «обновления» на страницу-ошибку вместо скрипта
+        if #body < MIN_SCRIPT_SIZE then
+            updaterStatus = L'файл повреждён'
+            logAct('Download rejected: too small (' .. #body .. ' b)')
+            notify(L'Скачался битый файл (' .. #body .. L' байт)', 0xFF0000)
+            return
+        end
+
         if not body:find('script_name', 1, true) then
-            logAct('Download failed: not a script')
-            notify(L'Ошибка скачивания обновления', 0xFF0000)
+            updaterStatus = L'это не скрипт'
+            logAct('Download rejected: no script_name')
+            notify(L'На GitHub лежит не скрипт', 0xFF0000)
             return
         end
 
-        local tmp = WORK_DIR .. '/update_tmp.tmp'
+        -- Защита от отката: не ставим версию старше текущей
+        local dlVer = body:match("script_version%s*%(%s*['\"]([%d%.]+)['\"]")
+        if dlVer and verLt(dlVer, LOCAL_VERSION) then
+            updaterStatus = L'на GitHub старее'
+            logAct('Download aborted: remote v' .. dlVer .. ' < local v' .. LOCAL_VERSION)
+            notify(L'На GitHub версия старее (v' .. dlVer .. ') - отмена', 0xFF0000)
+            return
+        end
+        if dlVer and remoteVersion ~= '' and dlVer ~= remoteVersion then
+            logAct('Warning: version.txt = ' .. remoteVersion .. ', file = ' .. dlVer)
+        end
+
+        local tmp = WORK_DIR .. '/taxord_update.lua'
         if not writeFile(tmp, body) then
-            notify(L'Ошибка записи обновления', 0xFF0000)
+            updaterStatus = L'ошибка записи'
+            notify(L'Не удалось записать обновление', 0xFF0000)
             return
         end
 
-        local dest = scriptPath()
+        local dest   = scriptPath()
         local backup = dest .. '.bak'
+        local installed = false
 
-        -- сначала бэкап: если подмена не удастся, скрипт останется рабочим
+        -- 1) штатная замена через rename (с бэкапом)
         os.remove(backup)
-        if not os.rename(dest, backup) then
-            -- файл только для чтения (частая ситуация на Android)
+        if os.rename(dest, backup) then
+            if os.rename(tmp, dest) then
+                installed = true
+            else
+                os.rename(backup, dest)
+                os.remove(tmp)
+            end
+        end
+
+        -- 2) если rename не дал (Android/лок файла) - пробуем перезаписать напрямую
+        if not installed then
+            if writeFile(dest, body) then
+                installed = true
+            end
             os.remove(tmp)
-            logAct('Rename failed: dest is read-only')
-            notify(L'Нет доступа к файлу скрипта', 0xFF0000)
+        end
+
+        -- 3) совсем не вышло - кладём рядом и просим заменить вручную
+        if not installed then
+            local alt = dest:gsub('%.lua$', '') .. '_new.lua'
+            if writeFile(alt, body) then
+                updaterStatus = L'нужна ручная замена'
+                logAct('Install failed, saved to ' .. alt)
+                notify(L'Файл занят. Новый сохранён: ' .. alt, 0xFFAA00)
+            else
+                updaterStatus = L'нет доступа к файлу'
+                logAct('Install failed: cannot write ' .. tostring(dest))
+                notify(L'Нет доступа к файлу скрипта', 0xFF0000)
+            end
             return
         end
 
-        if not os.rename(tmp, dest) then
-            os.rename(backup, dest)
-            os.remove(tmp)
-            logAct('Rename failed, backup restored')
-            notify(L'Ошибка установки обновления', 0xFF0000)
-            return
-        end
+        updateAvailable   = false
+        promptedVersion   = nil
+        updaterStatus     = L'установлено v' .. (dlVer or remoteVersion)
+        logAct('Update installed: v' .. tostring(dlVer or remoteVersion) .. ' -> ' .. tostring(dest))
+        notify(L'Обновление установлено - перезапуск скрипта...', 0x00FF00)
+        wait(1200)
 
-        os.remove(backup)
-        updateAvailable = false
-        logAct('Update installed: ' .. tostring(remoteVersion))
-        notify(L'Обновление скачано. Перезапустите игру.', 0x00FF00)
-
-        -- если загрузчик умеет перезагружать скрипт - делаем это сами
-        wait(800)
         local okInfo, info = pcall(thisScript)
         if okInfo and info then
             local okReload = pcall(function() info:reload() end)
-            if okReload then
-                logAct('Script reloaded')
-            end
+            if okReload then logAct('Script reloaded') end
         end
     end)
 end
 
 local function startUpdateCheck()
-    if not canDownload then return end
+    logAct('Updater: transports = ' .. updaterTransportsText()
+        .. ', local v' .. LOCAL_VERSION)
+    if not canDownload then
+        updaterStatus = L'нет http-транспорта'
+        logAct('Updater: no transport, auto-check skipped')
+        return
+    end
+    lastAutoCheck = os.time()
     lua_thread.create(function()
-        wait(10000)
-        doCheck()
+        wait(AUTO_CHECK_DELAY * 1000)
+        doCheck(true)
     end)
 end
 
@@ -566,7 +753,7 @@ local function sendTapPacketWithIndex(index)
 end
 
 -- ============================================================
---  УТИЛИТЫ
+--  УТИЛИТЫ И ОТЧЁТЫ
 -- ============================================================
 local function parseMoney(s)
     if not s then return 0 end
@@ -580,6 +767,39 @@ local function stripColors(t)
     return (t:gsub('{%x%x%x%x%x%x}', ''):gsub('{%x%x%x%x%x%x%x%x}', ''))
 end
 
+local ZP_LABEL = { taxi = L'Такси', trucker = L'Дальнобойщик', collector = L'Инкассатор' }
+local ZP_DIALOG_ID = 8888
+
+local function zpTotal() return ZP.taxi + ZP.trucker + ZP.collector end
+
+local function zpReportText()
+    local lines = {
+        L'Автоловля заказов:',
+        string.format(L'  Заказов выполнено: %d', CFG.ordersDone),
+        string.format(L'  Заработано: $%s', zpFormatMoney(CFG.moneyEarned)),
+        '',
+        L'Выплаты по работам:',
+        L'  Такси:          $' .. zpFormatMoney(ZP.taxi),
+        L'  Дальнобойщик:   $' .. zpFormatMoney(ZP.trucker),
+        L'  Инкассатор:     $' .. zpFormatMoney(ZP.collector),
+        '',
+        L'Всего по работам: $' .. zpFormatMoney(zpTotal()),
+        '',
+        L'/resetstat - сброс статистики',
+    }
+    return table.concat(lines, '\n')
+end
+
+local function resetAllStats()
+    CFG.ordersDone  = 0
+    CFG.moneyEarned = 0
+    ZP.taxi, ZP.trucker, ZP.collector = 0, 0, 0
+    statDispOrders  = 0
+    statDispMoney   = 0
+    markDirty()
+    saveCfg()
+end
+
 -- ============================================================
 --  СОСТОЯНИЕ
 -- ============================================================
@@ -588,18 +808,13 @@ local awaitingDialog = false
 local awaitingExpire = 0
 local lastTapTime    = 0
 local hasActiveOrder = false
-
 local pendingAccept       = nil
 local pendingAcceptNotif  = false
-
 local tapSequenceActive = false
 local tapSeqIndex       = 0
 local tapSeqNextSend    = 0
 local tapSeqRejected    = {}
 
--- ============================================================
---  ЗАВЕРШЕНИЕ ЗАКАЗА
--- ============================================================
 local function finishOrder(reason)
     if not hasActiveOrder then return end
     hasActiveOrder = false
@@ -619,7 +834,7 @@ local function resetCatchCycle(reason)
 end
 
 -- ============================================================
---  ЧАТ
+--  СОБЫТИЯ ЧАТА
 -- ============================================================
 local function isPlayerMessage(text)
     if text:find(L'говорит:', 1, true) then return true end
@@ -633,6 +848,24 @@ function sampev.onServerMessage(color, text)
     if not active then return end
 
     local cleanN = normalize(stripColors(text))
+
+    if zpIsPayout(cleanN) then
+        local amount = zpExtractMoney(stripColors(text))
+        local job    = zpDetectJob(cleanN)
+        if amount and job then
+            if zpMovedDist < ZP_MOVE_THRESHOLD then
+                logAct(string.format('Payout ignored (%s %d): moved %.1f < %.0f',
+                    job, amount, zpMovedDist, ZP_MOVE_THRESHOLD))
+            else
+                ZP[job] = ZP[job] + amount
+                zpMovedDist = 0.0
+                markDirty()
+                logAct(string.format('Payout %s +%d (total %d)', job, amount, ZP[job]))
+                notify(L'ЗП ' .. ZP_LABEL[job] .. ': +$' .. zpFormatMoney(amount) ..
+                    L' | Всего: $' .. zpFormatMoney(ZP[job]), 0x00FF00)
+            end
+        end
+    end
 
     if cleanN:find(L'клиент оплатил', 1, true) then
         local cash = parseMoney(stripColors(text))
@@ -683,7 +916,6 @@ function sampev.onServerMessage(color, text)
         end
     end
 
-    -- НОВЫЙ ЗАКАЗ в чате
     if CFG.catchEnabled
        and not hasActiveOrder
        and not tapSequenceActive
@@ -713,7 +945,7 @@ function sampev.onServerMessage(color, text)
 end
 
 -- ============================================================
---  ДИАЛОГИ
+--  СОБЫТИЯ ДИАЛОГОВ
 -- ============================================================
 local function respondSoon(id, button, why)
     lua_thread.create(function()
@@ -728,6 +960,9 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
     logDlg(string.format('id=%s title=%q b1=%q b2=%q',
         tostring(id), tostring(title), tostring(b1), tostring(b2)))
     if text and text ~= '' then logRaw('      TEXT | ' .. tostring(text):sub(1, 200)) end
+
+    if tonumber(id) == ZP_DIALOG_ID then return end
+    if tonumber(id) == UPDATE_DIALOG_ID then return end
     if not active then return end
 
     local titleN = normalize(stripColors(title or ''))
@@ -735,7 +970,6 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
     local b1N    = normalize(b1 or '')
     local b2N    = normalize(b2 or '')
 
-    -- ЗАЩИТА: платёжные/договорные окна не трогаем никогда
     local isPayment = bodyN:find(':cash:', 1, true)
                    or bodyN:find(L'вознаграждение', 1, true)
     if isPayment then
@@ -767,7 +1001,6 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
         return
     end
 
-    -- Заказ приходит ДИАЛОГОМ: упоминается заказ/такси, кнопка 1 = Взять/Принять/Да
     local isOrderLike = titleN:find(L'заказ', 1, true)
                      or titleN:find(L'такс', 1, true)
                      or bodyN:find(L'заказ', 1, true)
@@ -816,6 +1049,18 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
         tostring(id), tostring(b1), tostring(b2)))
 end
 
+-- Ответ на диалог "Обновить сейчас / Позже"
+function sampev.onDialogResponse(id, button, list, input)
+    if tonumber(id) ~= UPDATE_DIALOG_ID then return end
+    logAct('Update dialog: button=' .. tostring(button))
+    if button == 1 then
+        doUpdate()
+    else
+        notify(L'Обновление отложено. Команда: /update', 0xFFAA00)
+    end
+    return false
+end
+
 -- ============================================================
 --  UI
 -- ============================================================
@@ -831,10 +1076,7 @@ function ToggleButton(label, bool, a_speed)
     local r = h / 2
     local s = a_speed or 0.2
 
-    local function ImSaturate(f)
-        return f < 0.0 and 0.0 or (f > 1.0 and 1.0 or f)
-    end
-
+    local function ImSaturate(f) return f < 0.0 and 0.0 or (f > 1.0 and 1.0 or f) end
     local x_begin = bool[0] and 1.0 or 0.0
     local t_begin = bool[0] and 0.0 or 1.0
 
@@ -888,12 +1130,14 @@ end
 
 function GlassChild(name, size, fun)
     imgui.PushStyleColor(imgui.Col.ChildBg, imgui.ImVec4(1, 1, 1, 0.08))
-    imgui.BeginChild(name, size, false)
-    imgui.SetCursorPos(imgui.ImVec2(10, 10))
-    imgui.Text(name)
-    imgui.Separator()
-    imgui.SetCursorPosY(48)
-    fun()
+    local visible = imgui.BeginChild(name, size, false)
+    if visible then
+        imgui.SetCursorPos(imgui.ImVec2(10, 10))
+        imgui.Text(name)
+        imgui.Separator()
+        imgui.SetCursorPosY(56)
+        fun()
+    end
     imgui.EndChild()
     imgui.PopStyleColor()
 end
@@ -904,20 +1148,17 @@ end
 local function DrawLogo(x, y)
     local DL = imgui.GetWindowDrawList()
     local p  = imgui.ImVec2(x, y)
-
-    local panelW, panelH = 175, 56
+    local panelW, panelH = 210, 70
 
     DL:AddRectFilled(
         imgui.ImVec2(p.x + 3, p.y + 4),
         imgui.ImVec2(p.x + panelW + 3, p.y + panelH + 4),
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0, 0, 0, 0.55)),
-        11)
+        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0, 0, 0, 0.55)), 11)
 
     DL:AddRectFilled(
         imgui.ImVec2(p.x, p.y),
         imgui.ImVec2(p.x + panelW, p.y + panelH),
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 1.0)),
-        11)
+        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 1.0)), 11)
 
     local t = (os.clock() % 4.0) / 4.0
     if t < 0.35 then
@@ -928,16 +1169,14 @@ local function DrawLogo(x, y)
         DL:AddRectFilled(
             imgui.ImVec2(sx - 20, p.y - 5),
             imgui.ImVec2(sx + 20, p.y + panelH + 5),
-            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 1, 1, 0.28)),
-            10)
+            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 1, 1, 0.28)), 10)
         DL:PopClipRect()
     end
 
     DL:AddRect(
         imgui.ImVec2(p.x, p.y),
         imgui.ImVec2(p.x + panelW, p.y + panelH),
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)),
-        11, 0, 2)
+        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)), 11, 0, 2)
 
     local stripes = 6
     local stripeH = panelH / stripes
@@ -945,36 +1184,31 @@ local function DrawLogo(x, y)
         if i % 2 == 0 then
             DL:AddRectFilled(
                 imgui.ImVec2(p.x + 1, p.y + i * stripeH + 1),
-                imgui.ImVec2(p.x + 9, p.y + (i + 1) * stripeH - 1),
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)),
-                0)
+                imgui.ImVec2(p.x + 12, p.y + (i + 1) * stripeH - 1),
+                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)), 0)
             DL:AddRectFilled(
-                imgui.ImVec2(p.x + panelW - 9, p.y + i * stripeH + 1),
+                imgui.ImVec2(p.x + panelW - 12, p.y + i * stripeH + 1),
                 imgui.ImVec2(p.x + panelW - 1, p.y + (i + 1) * stripeH - 1),
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)),
-                0)
+                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)), 0)
         end
     end
 
     local pulse = 0.5 + 0.5 * math.sin(os.clock() * 2.5)
-    DL:AddCircleFilled(imgui.ImVec2(p.x + 30, p.y + panelH / 2), 16,
+    DL:AddCircleFilled(imgui.ImVec2(p.x + 38, p.y + panelH / 2), 20,
         imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)))
-    DL:AddCircle(imgui.ImVec2(p.x + 30, p.y + panelH / 2), 16,
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.4 + pulse * 0.6)),
-        24, 2)
+    DL:AddCircle(imgui.ImVec2(p.x + 38, p.y + panelH / 2), 20,
+        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.4 + pulse * 0.6)), 24, 2)
 
     if FONT_LOGO then imgui.PushFont(FONT_LOGO) end
     DL:AddText(
-        imgui.ImVec2(p.x + 23, p.y + panelH / 2 - 12),
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 1.0)),
-        'T')
+        imgui.ImVec2(p.x + 28, p.y + panelH / 2 - 15),
+        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 1.0)), 'T')
     if FONT_LOGO then imgui.PopFont() end
 
     if FONT_LOGO then imgui.PushFont(FONT_LOGO) end
     DL:AddText(
-        imgui.ImVec2(p.x + 56, p.y + 12),
-        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)),
-        'TAXORD')
+        imgui.ImVec2(p.x + 70, p.y + 15),
+        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)), 'TAXORD')
     if FONT_LOGO then imgui.PopFont() end
 end
 
@@ -984,12 +1218,26 @@ end
 local tabsList = { selected = '1:1', tabs = {} }
 
 local function GlassWindow(title, var, closeButton, leftSize, tabs, flags)
-    local size = imgui.ImVec2(800, 470)
-    local res  = imgui.ImVec2(getScreenResolution())
+    local sw, sh = getScreenResolution()
+    local res    = imgui.ImVec2(sw, sh)
 
-    imgui.SetNextWindowPos(imgui.ImVec2(res.x / 2, res.y / 2),
-        imgui.Cond.FirstUseEver, imgui.ImVec2(0.5, 0.5))
-    imgui.SetNextWindowSize(size, imgui.Cond.FirstUseEver)
+    -- Инициализация позиции окна
+    if not winPosInit then
+        winPos = imgui.ImVec2(res.x / 2, res.y / 2)
+        winPosInit = true
+    end
+
+    local defW = math.min(1200, sw - 60)
+    local defH = math.min(800,  sh - 60)
+    local minW = math.min(760, sw - 60)
+    local minH = math.min(560, sh - 60)
+
+    -- Вместо SetWindowPos используем SetNextWindowPos, он безопасен
+    imgui.SetNextWindowPos(winPos, imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
+    imgui.SetNextWindowSize(imgui.ImVec2(defW, defH), imgui.Cond.FirstUseEver)
+    imgui.SetNextWindowSizeConstraints(
+        imgui.ImVec2(minW, minH),
+        imgui.ImVec2(math.max(minW, sw - 40), math.max(minH, sh - 40)))
 
     imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, windowAlpha)
 
@@ -1001,136 +1249,113 @@ local function GlassWindow(title, var, closeButton, leftSize, tabs, flags)
         local FGDL = imgui.GetForegroundDrawList()
         local DL   = imgui.GetWindowDrawList()
 
+        -- Перетаскивание
+        imgui.SetCursorPos(imgui.ImVec2(40, 0))
+        imgui.InvisibleButton('##window_drag', imgui.ImVec2(math.max(10, wsize.x - 60), 46))
+        if imgui.IsItemActive() and imgui.IsMouseDragging(0) then
+            local d = imgui.GetIO().MouseDelta
+            winPos.x = winPos.x + d.x
+            winPos.y = winPos.y + d.y
+        end
+
+        -- Индикатор ресайза
+        do
+            local c = imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.55))
+            for i = 1, 3 do
+                DL:AddLine(
+                    imgui.ImVec2(pos.x + wsize.x - 4,        pos.y + wsize.y - 4 - i * 5),
+                    imgui.ImVec2(pos.x + wsize.x - 4 - i * 5, pos.y + wsize.y - 4),
+                    c, 1.5)
+            end
+        end
+
         DL:AddRectFilled(
             imgui.ImVec2(pos.x + leftSize, pos.y),
             imgui.ImVec2(pos.x + wsize.x, pos.y + wsize.y),
-            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 0.72)),
-            11, 2 + 8)
+            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 0.72)), 11, 2 + 8)
         DL:AddRectFilled(
             pos,
             imgui.ImVec2(pos.x + leftSize, pos.y + wsize.y),
-            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 0.55)),
-            11, 1 + 4)
+            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 0.55)), 11, 1 + 4)
 
         do
             local pulse = 0.55 + 0.45 * math.sin(os.clock() * 2.5)
             local dotColor = hasActiveOrder
                 and imgui.ImVec4(0.2, 1.0, 0.3, pulse)
                 or  imgui.ImVec4(1.0, 0.8, 0.2, pulse)
-            DL:AddCircleFilled(
-                imgui.ImVec2(pos.x + wsize.x - 22, pos.y + 22), 5,
+            DL:AddCircleFilled(imgui.ImVec2(pos.x + wsize.x - 24, pos.y + 24), 6,
                 imgui.ColorConvertFloat4ToU32(dotColor))
-            DL:AddCircle(
-                imgui.ImVec2(pos.x + wsize.x - 22, pos.y + 22), 9,
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(dotColor.x, dotColor.y, dotColor.z, pulse * 0.4)),
-                20, 1.5)
+            DL:AddCircle(imgui.ImVec2(pos.x + wsize.x - 24, pos.y + 24), 10,
+                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(dotColor.x, dotColor.y, dotColor.z, pulse * 0.4)), 20, 1.5)
         end
 
         imgui.SetCursorPos(imgui.ImVec2(15, 15))
         local cp = imgui.GetCursorScreenPos()
-        imgui.InvisibleButton('##CLOSEBUTTON', imgui.ImVec2(18, 18))
+        imgui.InvisibleButton('##CLOSEBUTTON', imgui.ImVec2(22, 22))
         if imgui.IsItemClicked() then var[0] = false end
         local hover = imgui.IsItemHovered()
-        FGDL:AddCircleFilled(
-            imgui.ImVec2(cp.x + 9, cp.y + 9), 8,
-            imgui.ColorConvertFloat4ToU32(hover
-                and imgui.ImVec4(0.9, 0.28, 0.28, 1)
-                or  imgui.ImVec4(1, 0.32, 0.31, 1)))
+        FGDL:AddCircleFilled(imgui.ImVec2(cp.x + 11, cp.y + 11), 9,
+            imgui.ColorConvertFloat4ToU32(hover and imgui.ImVec4(0.9, 0.28, 0.28, 1) or imgui.ImVec4(1, 0.32, 0.31, 1)))
         if hover then
-            FGDL:AddCircle(
-                imgui.ImVec2(cp.x + 9, cp.y + 9), 10,
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 0.32, 0.31, 0.4)),
-                20, 1.5)
+            FGDL:AddCircle(imgui.ImVec2(cp.x + 11, cp.y + 11), 11,
+                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 0.32, 0.31, 0.4)), 20, 1.5)
         end
 
-        DrawLogo(pos.x + 20, pos.y + 44)
+        DrawLogo(pos.x + 20, pos.y + 50)
 
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        imgui.SetCursorPos(imgui.ImVec2(24, 110))
+        imgui.SetCursorPos(imgui.ImVec2(24, 135))
         imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1.0), u8(L'Автоловля заказов'))
         if FONT_SUB then imgui.PopFont() end
 
-        imgui.SetCursorPos(imgui.ImVec2(15, 150))
+        imgui.SetCursorPos(imgui.ImVec2(15, 175))
         for categoryIndex, category in pairs(tabs.tabs) do
             for tabIndex, tab in pairs(category.list) do
                 local key  = ('%s:%s'):format(categoryIndex, tabIndex)
                 local isSel = tabs.selected == key
-
                 if tabHover[key] == nil then tabHover[key] = isSel and 1 or 0 end
 
                 local tpos = imgui.GetCursorScreenPos()
-                local th = 34
+                local th = 42
                 local tw = leftSize - 30
 
                 imgui.SetCursorPosX(20)
                 imgui.InvisibleButton('##TAB_' .. key, imgui.ImVec2(tw, th))
                 local hovered = imgui.IsItemHovered()
-
                 local target = (hovered or isSel) and 1 or 0
                 tabHover[key] = tabHover[key] + (target - tabHover[key]) * 0.22
 
                 local hv = tabHover[key]
-                local bgCol
+                local bgCol = isSel and imgui.ImVec4(1.0, 0.78, 0.05, 0.95) or imgui.ImVec4(0.13 + hv * 0.06, 0.13 + hv * 0.06, 0.13 + hv * 0.06, 0.85)
+
                 if isSel then
-                    bgCol = imgui.ImVec4(1.0, 0.78, 0.05, 0.95)
-                else
-                    bgCol = imgui.ImVec4(
-                        0.13 + hv * 0.06,
-                        0.13 + hv * 0.06,
-                        0.13 + hv * 0.06,
-                        0.85)
+                    DL:AddRectFilled(imgui.ImVec2(tpos.x - 3, tpos.y - 3), imgui.ImVec2(tpos.x + tw + 3, tpos.y + th + 3),
+                        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.18)), 10)
                 end
-
+                DL:AddRectFilled(tpos, imgui.ImVec2(tpos.x + tw, tpos.y + th), imgui.ColorConvertFloat4ToU32(bgCol), 8)
                 if isSel then
-                    DL:AddRectFilled(
-                        imgui.ImVec2(tpos.x - 3, tpos.y - 3),
-                        imgui.ImVec2(tpos.x + tw + 3, tpos.y + th + 3),
-                        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.18)),
-                        10)
-                end
-
-                DL:AddRectFilled(
-                    tpos,
-                    imgui.ImVec2(tpos.x + tw, tpos.y + th),
-                    imgui.ColorConvertFloat4ToU32(bgCol),
-                    8)
-
-                if isSel then
-                    DL:AddRect(
-                        tpos,
-                        imgui.ImVec2(tpos.x + tw, tpos.y + th),
-                        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)),
-                        8, 0, 2)
+                    DL:AddRect(tpos, imgui.ImVec2(tpos.x + tw, tpos.y + th),
+                        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.05, 0.05, 0.05, 1.0)), 8, 0, 2)
                 end
 
                 local ts = imgui.CalcTextSize(tab.name)
-                local tx = tpos.x + tw / 2 - ts.x / 2
-                local ty = tpos.y + th / 2 - ts.y / 2
-                local textCol = isSel
-                    and imgui.ImVec4(0.05, 0.05, 0.05, 1.0)
-                    or  imgui.ImVec4(0.9, 0.9, 0.9, 1.0)
-
-                DL:AddText(imgui.ImVec2(tx, ty),
+                local textCol = isSel and imgui.ImVec4(0.05, 0.05, 0.05, 1.0) or imgui.ImVec4(0.9, 0.9, 0.9, 1.0)
+                DL:AddText(imgui.ImVec2(tpos.x + tw / 2 - ts.x / 2, tpos.y + th / 2 - ts.y / 2),
                     imgui.ColorConvertFloat4ToU32(textCol), tab.name)
 
-                if imgui.IsItemClicked() then
-                    tabs.selected = key
-                end
-
-                imgui.SetCursorPosY(imgui.GetCursorPosY() + 4)
+                if imgui.IsItemClicked() then tabs.selected = key end
+                imgui.SetCursorPosY(imgui.GetCursorPosY() + 6)
             end
         end
 
         imgui.SetCursorPos(imgui.ImVec2(leftSize + 15, 15))
-
         imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, windowAlpha * tabFade)
 
-        if imgui.BeginChild('content',
-            imgui.ImVec2(wsize.x - leftSize - 30, wsize.y - 30), true) then
+        local contentW = math.max(100, wsize.x - leftSize - 30)
+        local contentH = math.max(100, wsize.y - 30)
 
-            if tabSlide > 0 then
-                imgui.SetCursorPosX(imgui.GetCursorPosX() + tabSlide)
-            end
+        if imgui.BeginChild('content', imgui.ImVec2(contentW, contentH), true) then
+            if tabSlide > 0 then imgui.SetCursorPosX(imgui.GetCursorPosX() + tabSlide) end
 
             local section, tabIdx = tabs.selected:match('(%d+):(%d+)')
             local sIdx, tIdx = tonumber(section), tonumber(tabIdx)
@@ -1142,12 +1367,9 @@ local function GlassWindow(title, var, closeButton, leftSize, tabs, flags)
             end
         end
         imgui.EndChild()
-
         imgui.PopStyleVar()
-
         imgui.End()
     end
-
     imgui.PopStyleVar()
 end
 
@@ -1177,31 +1399,18 @@ imgui.OnInitialize(function()
         local fh = io.open(path, 'r')
         if fh then
             fh:close()
-            local ok, font = pcall(function()
-                return imio.Fonts:AddFontFromFileTTF(path, 16, nil, cyr_ranges)
-            end)
-            if ok and font then
-                imio.FontDefault = font
-                loaded = true
-                break
-            end
+            local ok, font = pcall(function() return imio.Fonts:AddFontFromFileTTF(path, 20, nil, cyr_ranges) end)
+            if ok and font then imio.FontDefault = font; loaded = true; break end
         end
     end
-    if not loaded then
-        pcall(function() imio.Fonts:AddFontDefault() end)
-    end
+    if not loaded then pcall(function() imio.Fonts:AddFontDefault() end) end
 
     for _, path in ipairs(bold_paths) do
         local fh = io.open(path, 'r')
         if fh then
             fh:close()
-            local ok, font = pcall(function()
-                return imio.Fonts:AddFontFromFileTTF(path, 26, nil, cyr_ranges)
-            end)
-            if ok and font then
-                FONT_LOGO = font
-                break
-            end
+            local ok, font = pcall(function() return imio.Fonts:AddFontFromFileTTF(path, 30, nil, cyr_ranges) end)
+            if ok and font then FONT_LOGO = font; break end
         end
     end
     if not FONT_LOGO then FONT_LOGO = imio.FontDefault end
@@ -1210,13 +1419,8 @@ imgui.OnInitialize(function()
         local fh = io.open(path, 'r')
         if fh then
             fh:close()
-            local ok, font = pcall(function()
-                return imio.Fonts:AddFontFromFileTTF(path, 14, nil, cyr_ranges)
-            end)
-            if ok and font then
-                FONT_SUB = font
-                break
-            end
+            local ok, font = pcall(function() return imio.Fonts:AddFontFromFileTTF(path, 16, nil, cyr_ranges) end)
+            if ok and font then FONT_SUB = font; break end
         end
     end
     if not FONT_SUB then FONT_SUB = imio.FontDefault end
@@ -1225,13 +1429,8 @@ imgui.OnInitialize(function()
         local fh = io.open(path, 'r')
         if fh then
             fh:close()
-            local ok, font = pcall(function()
-                return imio.Fonts:AddFontFromFileTTF(path, 22, nil, cyr_ranges)
-            end)
-            if ok and font then
-                FONT_BIG = font
-                break
-            end
+            local ok, font = pcall(function() return imio.Fonts:AddFontFromFileTTF(path, 28, nil, cyr_ranges) end)
+            if ok and font then FONT_BIG = font; break end
         end
     end
     if not FONT_BIG then FONT_BIG = FONT_LOGO end
@@ -1244,9 +1443,9 @@ imgui.OnInitialize(function()
     style.PopupRounding     = 8
     style.ScrollbarRounding = 8
     style.GrabRounding      = 5
-    style.ItemSpacing       = imgui.ImVec2(8, 8)
-    style.ItemInnerSpacing  = imgui.ImVec2(6, 6)
-    style.FramePadding      = imgui.ImVec2(8, 6)
+    style.ItemSpacing       = imgui.ImVec2(10, 10)
+    style.ItemInnerSpacing  = imgui.ImVec2(8, 8)
+    style.FramePadding      = imgui.ImVec2(10, 8)
     style.WindowBorderSize  = 0
 
     local col = style.Colors
@@ -1282,8 +1481,13 @@ local function OrdersTabFrame()
     if math.abs(statDispOrders - CFG.ordersDone) < 0.01 then statDispOrders = CFG.ordersDone end
     if math.abs(statDispMoney  - CFG.moneyEarned) < 0.5 then statDispMoney  = CFG.moneyEarned end
 
+    local avail  = imgui.GetContentRegionAvail()
+    local panelH = math.max(380, avail.y - 20)
+    local w1     = math.min(380, avail.x * 0.45)
+    local w2     = math.max(150, avail.x - w1 - 20)
+
     imgui.SetCursorPos(imgui.ImVec2(0, 10))
-    GlassChild(u8(L'Автоловля'), imgui.ImVec2(270, 390), function()
+    GlassChild(u8(L'Автоловля'), imgui.ImVec2(w1, panelH), function()
         local c = new.bool(CFG.catchEnabled)
         if ToggleButton(u8(L'Ловить заказы'), c, 0.2) then
             CFG.catchEnabled = c[0]; buf.catchEnabled[0] = c[0]; markDirty()
@@ -1299,14 +1503,13 @@ local function OrdersTabFrame()
         imgui.Spacing()
 
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1),
-            u8(L'Ловля через диалоги и чат.'))
+        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Ловля через диалоги и чат.'))
         imgui.TextWrapped(u8(L'Платёжные окна не трогаются автоматически.'))
         if FONT_SUB then imgui.PopFont() end
     end)
 
-    imgui.SetCursorPos(imgui.ImVec2(290, 10))
-    GlassChild(u8(L'Статистика'), imgui.ImVec2(250, 390), function()
+    imgui.SetCursorPos(imgui.ImVec2(w1 + 15, 10))
+    GlassChild(u8(L'Статистика'), imgui.ImVec2(w2, panelH), function()
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
         imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Заказов выполнено'))
         if FONT_SUB then imgui.PopFont() end
@@ -1321,7 +1524,7 @@ local function OrdersTabFrame()
         if FONT_SUB then imgui.PopFont() end
 
         if FONT_BIG then imgui.PushFont(FONT_BIG) end
-        imgui.TextColored(imgui.ImVec4(1.0, 0.78, 0.05, 1), '$' .. tostring(math.floor(statDispMoney + 0.5)))
+        imgui.TextColored(imgui.ImVec4(1.0, 0.78, 0.05, 1), '$' .. zpFormatMoney(statDispMoney + 0.5))
         if FONT_BIG then imgui.PopFont() end
 
         imgui.Spacing()
@@ -1348,73 +1551,136 @@ local function OrdersTabFrame()
         imgui.Separator()
         imgui.Spacing()
 
-        if imgui.Button(u8(L'Сбросить статистику'), imgui.ImVec2(-1, 30)) then
-            CFG.ordersDone = 0; CFG.moneyEarned = 0
-            statDispOrders = 0; statDispMoney = 0
-            markDirty()
-            notify(L'Статистика сброшена')
+        if imgui.Button(u8(L'Сбросить статистику'), imgui.ImVec2(-1, 38)) then
+            resetAllStats(); notify(L'Статистика сброшена')
         end
         imgui.Spacing()
-        if imgui.Button(u8(L'Сброс заказа'), imgui.ImVec2(-1, 30)) then
+        if imgui.Button(u8(L'Сброс заказа'), imgui.ImVec2(-1, 38)) then
             finishOrder('manual')
         end
         imgui.Spacing()
         if updateDownloading then
-            imgui.TextColored(imgui.ImVec4(1, 0.7, 0.2, 1), u8(L'Идёт проверка/скачивание...'))
-            imgui.Spacing()
+            imgui.TextColored(imgui.ImVec4(1, 0.7, 0.2, 1), u8(L'Идёт проверка/скачивание...')); imgui.Spacing()
         end
         if updateAvailable then
-            if imgui.Button(u8(L'Обновить до ') .. u8(remoteVersion), imgui.ImVec2(-1, 30)) then
-                doUpdate()
-            end
+            if imgui.Button(u8(L'Обновить до ') .. u8(remoteVersion), imgui.ImVec2(-1, 38)) then doUpdate() end
         else
-            if imgui.Button(u8(L'Проверить обновления'), imgui.ImVec2(-1, 30)) then
-                doCheck()
-            end
+            if imgui.Button(u8(L'Проверить обновления'), imgui.ImVec2(-1, 38)) then doCheck() end
         end
         imgui.Spacing()
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        imgui.TextColored(imgui.ImVec4(0.55, 0.62, 0.70, 1),
-            u8(L'Версия: ') .. LOCAL_VERSION)
+        imgui.TextColored(imgui.ImVec4(0.55, 0.62, 0.70, 1), u8(L'Версия: ') .. LOCAL_VERSION)
+        local statusCol = updateAvailable
+            and imgui.ImVec4(1.0, 0.78, 0.05, 1)
+            or  imgui.ImVec4(0.55, 0.62, 0.70, 1)
+        imgui.TextColored(statusCol, u8(L'Обновление: ') .. u8(updaterStatus))
         if FONT_SUB then imgui.PopFont() end
     end)
 end
 
 -- ============================================================
---  ТАБ: ИНФО
+--  ТАБ: ЗП
 -- ============================================================
-local function InfoTabFrame()
-    imgui.SetCursorPos(imgui.ImVec2(0, 10))
-    GlassChild(u8(L'О программе'), imgui.ImVec2(540, 390), function()
-        if FONT_BIG then imgui.PushFont(FONT_BIG) end
-        imgui.TextColored(imgui.ImVec4(1.0, 0.78, 0.05, 1), 'TAXORD 28.0.8')
-        if FONT_BIG then imgui.PopFont() end
+local ZP_JOB_LIST = {
+    { key = 'taxi',      label = L'Такси'        },
+    { key = 'trucker',   label = L'Дальнобойщик' },
+    { key = 'collector', label = L'Инкассатор'   },
+}
 
+local function ZpTabFrame()
+    local avail  = imgui.GetContentRegionAvail()
+    local panelH = math.max(380, avail.y - 20)
+    local w1     = math.min(420, avail.x * 0.5)
+    local w2     = math.max(150, avail.x - w1 - 20)
+
+    imgui.SetCursorPos(imgui.ImVec2(0, 10))
+    GlassChild(u8(L'Выплаты по работам'), imgui.ImVec2(w1, panelH), function()
+        for i, job in ipairs(ZP_JOB_LIST) do
+            if FONT_SUB then imgui.PushFont(FONT_SUB) end
+            imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(job.label))
+            if FONT_SUB then imgui.PopFont() end
+
+            if FONT_BIG then imgui.PushFont(FONT_BIG) end
+            imgui.TextColored(imgui.ImVec4(1.0, 0.78, 0.05, 1), '$' .. zpFormatMoney(ZP[job.key]))
+            if FONT_BIG then imgui.PopFont() end
+
+            if i < #ZP_JOB_LIST then imgui.Spacing(); imgui.Separator(); imgui.Spacing() end
+        end
+    end)
+
+    imgui.SetCursorPos(imgui.ImVec2(w1 + 15, 10))
+    GlassChild(u8(L'Итого и дистанция'), imgui.ImVec2(w2, panelH), function()
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Автоловля заказов такси'))
+        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Всего по работам'))
         if FONT_SUB then imgui.PopFont() end
 
-        imgui.Spacing()
-        imgui.Separator()
-        imgui.Spacing()
+        if FONT_BIG then imgui.PushFont(FONT_BIG) end
+        imgui.TextColored(imgui.ImVec4(1.0, 0.78, 0.05, 1), '$' .. zpFormatMoney(zpTotal()))
+        if FONT_BIG then imgui.PopFont() end
 
-        imgui.PushTextWrapPos(imgui.GetCursorPos().x + 510)
+        imgui.Spacing(); imgui.Separator(); imgui.Spacing()
+
+        if FONT_SUB then imgui.PushFont(FONT_SUB) end
+        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Проехано от выплаты:'))
+        imgui.TextColored(imgui.ImVec4(0.95, 0.96, 0.98, 1),
+            string.format(u8(L'%d / %d м'), math.floor(zpMovedDist), math.floor(ZP_MOVE_THRESHOLD)))
+        imgui.TextWrapped(u8(L'Выплата засчитывается только после реального проезда.'))
+        if FONT_SUB then imgui.PopFont() end
+
+        imgui.Spacing(); imgui.Separator(); imgui.Spacing()
+
+        if imgui.Button(u8(L'Сбросить ЗП'), imgui.ImVec2(-1, 38)) then
+            ZP.taxi, ZP.trucker, ZP.collector = 0, 0, 0
+            markDirty(); saveCfg(); notify(L'Счётчик ЗП сброшен')
+        end
+        imgui.Spacing()
+        if imgui.Button(u8(L'Сбросить всё'), imgui.ImVec2(-1, 38)) then
+            resetAllStats(); notify(L'Вся статистика сброшена')
+        end
+    end)
+end
+
+-- ============================================================
+--  ТАБ: ИНФО (Крупный текст)
+-- ============================================================
+local function InfoTabFrame()
+    local avail  = imgui.GetContentRegionAvail()
+    local panelW = math.max(150, avail.x)
+    local panelH = math.max(380, avail.y - 20)
+
+    imgui.SetCursorPos(imgui.ImVec2(0, 10))
+    GlassChild(u8(L'О программе'), imgui.ImVec2(panelW, panelH), function()
+        if FONT_BIG then imgui.PushFont(FONT_BIG) end
+        
+        imgui.TextColored(imgui.ImVec4(1.0, 0.78, 0.05, 1), 'TAXORD ' .. VERSION)
+        
+        imgui.Spacing(); imgui.Separator(); imgui.Spacing()
+
+        imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Автоловля заказов + счётчик зарплаты'))
+
+        imgui.Spacing(); imgui.Spacing()
+
+        imgui.PushTextWrapPos(math.max(50, imgui.GetCursorPos().x + panelW - 60))
         imgui.TextWrapped(u8(L'Ловит заказы двумя способами: через диалоги сервера и через чат.'))
         imgui.Spacing()
         imgui.TextWrapped(u8(L'Диалоги с оплатой (:CASH:) не нажимает автоматически.'))
+        imgui.Spacing()
+        imgui.TextWrapped(u8(L'Счётчик ЗП считает выплаты по работам (такси, дальнобойщик, инкассатор) и учитывает их только после реального проезда.'))
         imgui.Spacing()
         imgui.TextWrapped(u8(L'Обновление: проверка версии с GitHub, загрузка новой версии одной кнопкой.'))
         imgui.PopTextWrapPos()
 
         imgui.Spacing(); imgui.Spacing()
-        if FONT_SUB then imgui.PushFont(FONT_SUB) end
+
         imgui.TextColored(imgui.ImVec4(0.65, 0.72, 0.80, 1), u8(L'Команды:'))
         imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/taxord    - меню'))
-        imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/zarabotok - статистика в чат'))
+        imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/zarabotok - статистика (окно)'))
         imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/resetstat - сброс статистики'))
         imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/checkupd  - проверить обновление'))
         imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/update    - скачать обновление'))
-        if FONT_SUB then imgui.PopFont() end
+        imgui.TextColored(imgui.ImVec4(0.85, 0.85, 0.85, 1), u8(L'/updinfo   - диагностика обновления'))
+
+        if FONT_BIG then imgui.PopFont() end
     end)
 end
 
@@ -1423,23 +1689,19 @@ tabsList.tabs = {
         name = 'TAXORD',
         list = {
             { name = u8(L'Заказы'), icon = '', frame = OrdersTabFrame },
+            { name = u8(L'ЗП'),     icon = '', frame = ZpTabFrame     },
             { name = u8(L'Инфо'),   icon = '', frame = InfoTabFrame   },
         }
     }
 }
 
 -- ============================================================
---  ОКНО: рендер
+--  РЕНДЕР ОКНА
 -- ============================================================
 imgui.OnFrame(
-    function()
-        return windowRendering and isSampAvailable() and not isPauseMenuActive()
-    end,
+    function() return windowRendering and isSampAvailable() and not isPauseMenuActive() end,
     function(this)
-        -- ФИКС: пока меню открыто - захватываем тапы, чтобы они
-        -- не проходили в игру (не закрывалось и не писалось /help)
         this.ShowCursor = window[0]
-
         local target = window[0] and 1.0 or 0.0
         windowAlpha = windowAlpha + (target - windowAlpha) * 0.24
 
@@ -1450,9 +1712,7 @@ imgui.OnFrame(
         end
 
         if tabsList.selected ~= lastSelectedTab then
-            tabFade = 0
-            tabSlide = 50
-            lastSelectedTab = tabsList.selected
+            tabFade = 0; tabSlide = 50; lastSelectedTab = tabsList.selected
         end
         if tabFade < 1 then tabFade = math.min(1, tabFade + 0.075) end
         if tabSlide > 0 then
@@ -1460,13 +1720,12 @@ imgui.OnFrame(
             if tabSlide < 0 then tabSlide = 0 end
         end
 
-        GlassWindow('TaxordMenu', window, true, 200, tabsList,
-            imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse)
+        GlassWindow('TaxordMenu', window, true, 240, tabsList, imgui.WindowFlags.NoCollapse)
     end
 )
 
 -- ============================================================
---  ТОСТЫ
+--  ТОСТЫ (Уведомления)
 -- ============================================================
 imgui.OnFrame(
     function() return (sn.state ~= 'idle' or #sn.queue > 0) and not isPauseMenuActive() end,
@@ -1496,8 +1755,7 @@ imgui.OnFrame(
                     wait(0)
                 end
             end)
-        elseif sn.state == 'showing'
-            and (os.clock() - sn.timer) >= NOTIFY_DURATION then
+        elseif sn.state == 'showing' and (os.clock() - sn.timer) >= NOTIFY_DURATION then
             sn.state = 'hiding'
             sn.timer = os.clock()
             local myv = sn.version
@@ -1516,11 +1774,11 @@ imgui.OnFrame(
 
         local text = u8(sn.message)
         local ts   = imgui.CalcTextSize(text)
-        local pad_x = 70
-        local pad_y = 20
-        local iconSize = 40
+        local pad_x = 80
+        local pad_y = 24
+        local iconSize = 48
         local w_px = math.min(sw - 40, ts.x + pad_x * 2 + iconSize)
-        local h_px = math.max(64, ts.y + pad_y * 2)
+        local h_px = math.max(76, ts.y + pad_y * 2)
 
         local w_pos = imgui.ImVec2(sw / 2, sh - sn.anim * (h_px + 20) - 10)
 
@@ -1532,10 +1790,7 @@ imgui.OnFrame(
         imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(0, 0))
         imgui.PushStyleColor(imgui.Col.WindowBg, imgui.ImVec4(0, 0, 0, 0))
 
-        imgui.Begin('##TaxordToast', nil,
-            imgui.WindowFlags.NoMove +
-            imgui.WindowFlags.NoDecoration +
-            imgui.WindowFlags.NoInputs)
+        imgui.Begin('##TaxordToast', nil, imgui.WindowFlags.NoMove + imgui.WindowFlags.NoDecoration + imgui.WindowFlags.NoInputs)
 
         local p  = imgui.GetCursorScreenPos()
         local DL = imgui.GetWindowDrawList()
@@ -1545,11 +1800,8 @@ imgui.OnFrame(
 
         do
             local g = sn.glow * sn.anim
-            DL:AddRectFilled(
-                imgui.ImVec2(A.x - 4, A.y - 4),
-                imgui.ImVec2(B.x + 4, B.y + 4),
-                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.25 * g)),
-                18)
+            DL:AddRectFilled(imgui.ImVec2(A.x - 4, A.y - 4), imgui.ImVec2(B.x + 4, B.y + 4),
+                imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.25 * g)), 18)
         end
 
         local bg = imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.09, 0.08, 0.05, 0.95))
@@ -1559,41 +1811,34 @@ imgui.OnFrame(
         DL:PathFillConvex(bg)
 
         local ac = imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 1.0))
-        DL:AddRectFilled(imgui.ImVec2(A.x + 10, A.y + 12),
-            imgui.ImVec2(A.x + 14, B.y - 12), ac, 2)
+        DL:AddRectFilled(imgui.ImVec2(A.x + 12, A.y + 14), imgui.ImVec2(A.x + 18, B.y - 14), ac, 2)
 
         do
-            local icx = A.x + 42
+            local icx = A.x + 48
             local icy = A.y + h_px / 2
-            local ir  = 14
+            local ir  = 18
 
             local iconColor = imgui.ImVec4(0.15, 0.15, 0.15, 1)
             local iconBg    = imgui.ImVec4(1.0, 0.78, 0.05, 1)
             local iconChar  = 'i'
 
             if sn.icon == 'success' then
-                iconBg   = imgui.ImVec4(0.20, 0.85, 0.35, 1)
-                iconChar = '+'
+                iconBg   = imgui.ImVec4(0.20, 0.85, 0.35, 1); iconChar = '+'
             elseif sn.icon == 'warn' then
-                iconBg   = imgui.ImVec4(1.0, 0.78, 0.05, 1)
-                iconChar = '!'
+                iconBg   = imgui.ImVec4(1.0, 0.78, 0.05, 1); iconChar = '!'
             elseif sn.icon == 'error' then
-                iconBg   = imgui.ImVec4(0.95, 0.30, 0.30, 1)
-                iconChar = 'x'
+                iconBg   = imgui.ImVec4(0.95, 0.30, 0.30, 1); iconChar = 'x'
             end
 
             local g = sn.glow
             DL:AddCircleFilled(imgui.ImVec2(icx, icy), ir + 6 + g * 3,
                 imgui.ColorConvertFloat4ToU32(imgui.ImVec4(iconBg.x, iconBg.y, iconBg.z, 0.25 * g)))
-            DL:AddCircleFilled(imgui.ImVec2(icx, icy), ir,
-                imgui.ColorConvertFloat4ToU32(iconBg))
+            DL:AddCircleFilled(imgui.ImVec2(icx, icy), ir, imgui.ColorConvertFloat4ToU32(iconBg))
 
             if FONT_BIG then imgui.PushFont(FONT_BIG) end
             local its = imgui.CalcTextSize(iconChar)
-            DL:AddText(
-                imgui.ImVec2(icx - its.x / 2, icy - its.y / 2 - 2),
-                imgui.ColorConvertFloat4ToU32(iconColor),
-                iconChar)
+            DL:AddText(imgui.ImVec2(icx - its.x / 2, icy - its.y / 2 - 2),
+                imgui.ColorConvertFloat4ToU32(iconColor), iconChar)
             if FONT_BIG then imgui.PopFont() end
         end
 
@@ -1603,11 +1848,8 @@ imgui.OnFrame(
         do
             local progressW = (B.x - A.x - 20) * (1 - math.min(1, (os.clock() - sn.timer) / NOTIFY_DURATION))
             if progressW > 0 then
-                DL:AddRectFilled(
-                    imgui.ImVec2(A.x + 10, B.y - 4),
-                    imgui.ImVec2(A.x + 10 + progressW, B.y - 2),
-                    imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.7)),
-                    1)
+                DL:AddRectFilled(imgui.ImVec2(A.x + 12, B.y - 4), imgui.ImVec2(A.x + 12 + progressW, B.y - 2),
+                    imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1.0, 0.78, 0.05, 0.7)), 1)
             end
         end
 
@@ -1625,57 +1867,52 @@ function main()
 
     logInit()
     loadCfg()
-    logAct('Script loaded. v28.0.8 (utf8_file=' .. tostring(FILE_IS_UTF8) .. ')')
+    logAct('Script loaded. v' .. VERSION .. ' (utf8_file=' .. tostring(FILE_IS_UTF8) .. ')')
 
-    -- /taxord — открыть/закрыть меню
     sampRegisterChatCommand('taxord', function()
         if window[0] then
             window[0] = false
         else
-            window[0] = true
-            windowRendering = true
-            windowAlpha = 0
-            tabFade = 1
-            tabSlide = 0
-            lastSelectedTab = tabsList.selected
+            window[0] = true; windowRendering = true; windowAlpha = 0
+            tabFade = 1; tabSlide = 0; lastSelectedTab = tabsList.selected
         end
         logAct('Menu: ' .. tostring(window[0]))
     end)
 
-    -- /zarabotok — статистика в чат
     sampRegisterChatCommand('zarabotok', function()
-        local total  = CFG.moneyEarned
-        local orders = CFG.ordersDone
-        sampAddChatMessage(
-            string.format('{FFCC00}[TaxOrd] {FFFFFF}' .. L'Заказов: {00FF00}%d {FFFFFF}| ' .. L'Заработано: {00FF00}$%d',
-                orders, total),
-            -1)
-        notify(string.format(L'Заказов: %d | Заработано: $%d', orders, total), 0x00FF00)
-        logAct(string.format('/zarabotok -> orders=%d money=%d', orders, total))
+        sampShowDialog(ZP_DIALOG_ID, L'Заработок на работах', zpReportText(), L'ОК', L'Закрыть', 0)
     end)
 
-    -- /resetstat — сброс статистики
     sampRegisterChatCommand('resetstat', function()
-        CFG.ordersDone  = 0
-        CFG.moneyEarned = 0
-        statDispOrders  = 0
-        statDispMoney   = 0
-        markDirty()
-        saveCfg()
+        resetAllStats()
         notify(L'Статистика сброшена', 0xFFAA00)
-        logAct('/resetstat -> stats cleared')
     end)
 
-    -- /checkupd — проверить обновление
-    sampRegisterChatCommand('checkupd', doCheck)
+    sampRegisterChatCommand('checkupd', function() doCheck(false) end)
+    sampRegisterChatCommand('update', function() doUpdate() end)
+    sampRegisterChatCommand('updinfo', function()
+        notify(L'Версия: v' .. LOCAL_VERSION ..
+            ' | GitHub: v' .. (remoteVersion ~= '' and remoteVersion or '?'), 0xFFFF00)
+        notify(L'Транспорты: ' .. updaterTransportsText(), 0xFFFF00)
+        notify(L'Статус: ' .. updaterStatus, 0xFFFF00)
+    end)
 
-    -- /update — скачать обновление
-    sampRegisterChatCommand('update', doUpdate)
-
-    notify(L'TaxOrd 28.0.8 загружен, /taxord - меню', 0x00FF00)
-
-    -- автопроверка обновления через 10 секунд после загрузки
+    notify(L'TaxOrd ' .. VERSION .. L' загружен, /taxord - меню', 0x00FF00)
     startUpdateCheck()
+
+    lua_thread.create(function()
+        while true do
+            wait(500)
+            local x, y, z = getCharCoordinates(PLAYER_PED)
+            if x and y and z then
+                if zpLastX then
+                    local dx, dy, dz = x - zpLastX, y - zpLastY, z - zpLastZ
+                    zpMovedDist = zpMovedDist + math.sqrt(dx*dx + dy*dy + dz*dz)
+                end
+                zpLastX, zpLastY, zpLastZ = x, y, z
+            end
+        end
+    end)
 
     lastAutoSave = os.clock()
 
@@ -1683,16 +1920,41 @@ function main()
         wait(0)
         local now = os.clock()
 
+        -- Диалог "Доступно обновление?" показываем из главного потока
+        if pendingUpdatePrompt and now >= promptRetryAt then
+            local busy = false
+            if type(sampIsDialogActive) == 'function' then
+                local okBusy, v = pcall(sampIsDialogActive)
+                busy = (okBusy and v) and true or false
+            end
+            if not busy then
+                local shown = sampShowDialog(UPDATE_DIALOG_ID,
+                    L'Обновление TaxOrd',
+                    string.format(L'Доступна версия: %s\nУ вас установлена: %s\n\nОбновить скрипт сейчас?',
+                        remoteVersion, LOCAL_VERSION),
+                    L'Обновить', L'Позже', 0)
+                if shown then
+                    pendingUpdatePrompt = false
+                    logAct('Update prompt shown for v' .. remoteVersion)
+                else
+                    promptRetryAt = now + 3
+                end
+            end
+        end
+
+        -- Тихая проверка обновлений раз в 30 минут
+        if canDownload and not updateDownloading
+           and (os.time() - lastAutoCheck) >= AUTO_CHECK_EVERY then
+            lastAutoCheck = os.time()
+            doCheck(true)
+        end
+
         if cfgDirty and (now - lastAutoSave) > 1.5 then
-            lastAutoSave = now
-            saveCfg()
+            lastAutoSave = now; saveCfg()
         end
 
         if pendingAccept and (now - pendingAccept) > PENDING_TIMEOUT and not pendingAcceptNotif then
-            logAct('Pending accept timeout')
-            hasActiveOrder = false
-            pendingAccept = nil
-            resetCatchCycle('accept timeout')
+            hasActiveOrder = false; pendingAccept = nil; resetCatchCycle('accept timeout')
         end
 
         if tapSequenceActive then
@@ -1701,26 +1963,20 @@ function main()
                 while tapSeqIndex <= MAX_TAPS do
                     if not tapSeqRejected[tapSeqIndex] then
                         sendTapPacketWithIndex(tapSeqIndex)
-                        logAct('Tap sent: index=' .. tapSeqIndex)
                         tapSeqIndex = tapSeqIndex + 1
                         found = true
                         break
                     end
                     tapSeqIndex = tapSeqIndex + 1
                 end
-
                 if not found then
                     tapSequenceActive = false
-                    logAct('All indexes scanned - no dialog')
                 else
                     tapSeqNextSend = now + TAP_STEP_MS / 1000
                 end
             end
-
             if awaitingDialog and now > awaitingExpire then
-                awaitingDialog = false
-                tapSequenceActive = false
-                logAct('Dialog timeout')
+                awaitingDialog = false; tapSequenceActive = false
             end
         end
     end
