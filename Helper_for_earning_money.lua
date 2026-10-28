@@ -1,10 +1,10 @@
 -- Help_for_Job.lua
 -- MonetLoader 3.8.x / MoonLoader
 -- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам
--- v29.0.0
+-- v29.0.1
 
 script_name('HfJ')
-script_version('29.0.0')
+script_version('29.0.1')
 
 local imgui    = require 'mimgui'
 local new      = imgui.new
@@ -13,7 +13,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local sampev = require 'samp.events'
 
-local VERSION       = '29.0.0'
+local VERSION       = '29.0.1'
 local LOCAL_VERSION = VERSION
 
 -- ============================================================
@@ -1468,6 +1468,21 @@ local function GlassWindow(title, var, closeButton, leftSize, tabs, flags)
                 C(imgui.ImVec4(scol.x, scol.y, scol.z, pulse)))
             DL:AddText(imgui.ImVec2(px + SC(28), py + (ph - sts.y) / 2),
                 C(imgui.ImVec4(0.84, 0.88, 0.93, 1.0)), stxt)
+
+            -- Версия слева от статуса: видна всегда
+            local vtxt = 'v' .. LOCAL_VERSION
+            local vts  = imgui.CalcTextSize(vtxt)
+            local vw   = vts.x + SC(26)
+            local vh   = vts.y + SC(12)
+            local vx   = px - vw - SC(16)
+            local vy   = py
+
+            DL:AddRectFilled(imgui.ImVec2(vx, vy), imgui.ImVec2(vx + vw, vy + vh),
+                C(imgui.ImVec4(1.0, 0.78, 0.05, 0.10 * a)), vh / 2)
+            DL:AddRect(imgui.ImVec2(vx, vy), imgui.ImVec2(vx + vw, vy + vh),
+                C(imgui.ImVec4(1.0, 0.78, 0.05, 0.35 * a)), vh / 2, 0, SC(1))
+            DL:AddText(imgui.ImVec2(vx + SC(13), vy + (vh - vts.y) / 2),
+                C(imgui.ImVec4(1.00, 0.88, 0.42, 1.0)), vtxt)
             if FONT_SUB then imgui.PopFont() end
         end
 
