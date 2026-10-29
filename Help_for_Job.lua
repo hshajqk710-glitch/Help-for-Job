@@ -1,10 +1,10 @@
 -- Help_for_Job.lua
 -- MonetLoader 3.8.x / MoonLoader
--- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам + исправление автообновления
--- v29.0.2
+-- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам + исправление автообновления (30.10.2026)
+-- v29.0.3
 
 script_name('HfJ')
-script_version('29.0.2')
+script_version('29.0.3')
 
 local imgui    = require 'mimgui'
 local new      = imgui.new
@@ -13,7 +13,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local sampev = require 'samp.events'
 
-local VERSION       = '29.0.2'
+local VERSION       = '29.0.3'
 local LOCAL_VERSION = VERSION
 
 -- ============================================================
@@ -101,6 +101,7 @@ local statInit        = false
 -- Тумблеры создаём один раз: new.bool каждый кадр = мусор и утечки
 local tgCatch  = new.bool(false)
 local tgAccept = new.bool(false)
+local tgTurbo  = new.bool(false)
 
 -- ============================================================
 --  НОРМАЛИЗАЦИЯ СТРОК
@@ -121,7 +122,7 @@ local function normalize(s)
 end
 
 -- ============================================================
---  ПУТИ И ЛОГ
+--  ПУТИ И ЛОГ (С ОБРАБОТЧИКОМ ОШИБОК И ВРЕМЕНЕМ)
 -- ============================================================
 local WORK_DIR    = getWorkingDirectory()
 local CONFIG_DIR  = WORK_DIR .. '/config'
@@ -133,23 +134,50 @@ local LOG_FILE    = LOG_DIR .. '/hfj.log'
 if not doesDirectoryExist(CONFIG_DIR) then pcall(createDirectory, CONFIG_DIR) end
 if not doesDirectoryExist(LOG_DIR)    then pcall(createDirectory, LOG_DIR)    end
 
-local function logRaw(msg)
-    print('[HfJ] ' .. msg)
+local function logRaw(tag, msg)
+    local timeStr = os.date('%H:%M:%S.') .. string.format('%03d', math.floor((os.clock() % 1) * 1000))
+    local line
+    if msg == nil then
+        line = string.format('%s | %s', timeStr, tostring(tag or ''))
+    else
+        line = string.format('%s | %-5s | %s', timeStr, tostring(tag or 'INFO'), tostring(msg))
+    end
+    
+    print('[HfJ] ' .. line)
+    
     local f = io.open(LOG_FILE, 'a')
     if f then
-        f:write(os.date('%H:%M:%S.') ..
-            string.format('%03d', math.floor((os.clock() % 1) * 1000)) ..
-            ' | ' .. u8(tostring(msg)) .. '\n')
+        f:write(u8(line) .. '\n')
         f:close()
     end
 end
-local function logInit()
+
+-- Очистка файла лога и запись шапки запуска
+local function logInit(reason)
     local f = io.open(LOG_FILE, 'w')
-    if f then f:write('=== Help for Job v' .. VERSION .. ' ' .. os.date() .. ' ===\n'); f:close() end
+    if f then
+        f:write('============================================================\n')
+        f:write('=== Help for Job v' .. VERSION .. ' | ' .. os.date('%d.%m.%Y %H:%M:%S') .. ' ===\n')
+        f:write('=== Сессия: ' .. tostring(reason or 'Запуск скрипта') .. '\n')
+        f:write('============================================================\n')
+        f:close()
+    end
 end
-local function logChat(t) logRaw('CHAT  | ' .. tostring(t)) end
-local function logAct(t)  logRaw('ACT   | ' .. tostring(t)) end
-local function logDlg(t)  logRaw('DLG   | ' .. tostring(t)) end
+
+local function logChat(t) logRaw('CHAT',  t) end
+local function logAct(t)  logRaw('ACT',   t) end
+local function logDlg(t)  logRaw('DLG',   t) end
+local function logErr(t)  logRaw('ERROR', t) end
+
+-- Безопасный вызов функций: ошибки пишутся прямо в hfj.log с точным временем
+local function safeCall(name, fn, ...)
+    local ok, res = pcall(fn, ...)
+    if not ok then
+        logErr(string.format('Ошибка в [%s]: %s', tostring(name), tostring(res)))
+        return nil
+    end
+    return res
+end
 
 -- ============================================================
 --  КОНФИГ И СТАТИСТИКА
@@ -157,6 +185,7 @@ local function logDlg(t)  logRaw('DLG   | ' .. tostring(t)) end
 local CFG = {
     catchEnabled = true,
     autoAccept   = true,
+    turboCatch   = false, -- Турбо-ловля (0 мс)
     ordersDone   = 0,
     moneyEarned  = 0,
 }
@@ -169,6 +198,7 @@ local ZP_MOVE_THRESHOLD = 50.0
 local buf = {
     catchEnabled = new.bool(true),
     autoAccept   = new.bool(true),
+    turboCatch   = new.bool(false),
 }
 
 local function markDirty() cfgDirty = true end
@@ -176,11 +206,13 @@ local function markDirty() cfgDirty = true end
 local function cfgToBuf()
     buf.catchEnabled[0] = CFG.catchEnabled
     buf.autoAccept[0]   = CFG.autoAccept
+    buf.turboCatch[0]   = CFG.turboCatch
 end
 
 local function bufToCfg()
     CFG.catchEnabled = buf.catchEnabled[0]
     CFG.autoAccept   = buf.autoAccept[0]
+    CFG.turboCatch   = buf.turboCatch[0]
 end
 
 cfgToBuf()
@@ -191,6 +223,7 @@ local function saveCfg()
     if not f then return false end
     f:write('catchEnabled=' .. tostring(CFG.catchEnabled) .. '\n')
     f:write('autoAccept='   .. tostring(CFG.autoAccept)   .. '\n')
+    f:write('turboCatch='   .. tostring(CFG.turboCatch)   .. '\n')
     f:write('ordersDone='   .. tostring(CFG.ordersDone)   .. '\n')
     f:write('moneyEarned='  .. tostring(CFG.moneyEarned)  .. '\n')
     f:write('zpTaxi='       .. tostring(math.floor(ZP.taxi))      .. '\n')
@@ -211,6 +244,7 @@ local function loadCfg()
             local n = tonumber(v)
             if k == 'catchEnabled' then CFG.catchEnabled = (v == 'true') end
             if k == 'autoAccept'   then CFG.autoAccept   = (v == 'true') end
+            if k == 'turboCatch'   then CFG.turboCatch   = (v == 'true') end
             if k == 'ordersDone'   and n then CFG.ordersDone  = n end
             if k == 'moneyEarned'  and n then CFG.moneyEarned = n end
             if k == 'zpTaxi'       and n then ZP.taxi         = n end
@@ -834,9 +868,14 @@ end
 --  СОБЫТИЯ ЧАТА
 -- ============================================================
 local function isPlayerMessage(text)
+    if not text then return false end
     if text:find(L'говорит:', 1, true) then return true end
     if text:find(L'шепчет:', 1, true) then return true end
     if text:find(L'кричит:', 1, true) then return true end
+    -- Проверка на наличие ника игрока / формата чата (например, "[ID] Nick_Name:" или "Nick_Name[ID]:")
+    if text:find('%[%d+%]') or text:find('%a+_%a+:') or text:find('%a+_%a+%[%d+%]') then 
+        return true 
+    end
     return false
 end
 
@@ -845,6 +884,13 @@ function sampev.onServerMessage(color, text)
     if not active then return end
 
     local cleanN = normalize(stripColors(text))
+	
+	-- Очистка лога при перезаходе / новом спавне на сервере
+    if cleanN:find(L'добро пожаловать на arizona', 1, true)
+       or cleanN:find(L'вы выбрали местом спавна', 1, true) then
+        logInit('Реконнект / Вход в игру')
+        logAct('Новая игровая сессия: лог очищен')
+    end
 
     if zpIsPayout(cleanN) then
         local amount = zpExtractMoney(stripColors(text))
@@ -873,21 +919,36 @@ function sampev.onServerMessage(color, text)
         end
     end
 
-    if pendingAccept and (cleanN:find(L'заказ уже принят', 1, true)
-                       or cleanN:find(L'заказ недоступен', 1, true)) then
-        logAct('Server rejected our accept')
-        hasActiveOrder = false
-        pendingAccept = nil
-        pendingAcceptNotif = false
-        resetCatchCycle('accept rejected')
-        return
+    -- Если заказ отменили или забрали до того, как мы доехали
+    if (cleanN:find(L'клиент отменил заказ', 1, true)
+        or cleanN:find(L'заказ уже принят', 1, true)
+        or cleanN:find(L'заказ недоступен', 1, true)
+        or cleanN:find(L'заказ отмен', 1, true)) then
+        
+        if pendingAccept or hasActiveOrder or awaitingDialog then
+            logAct('Order cancelled or taken by another player')
+            hasActiveOrder = false
+            pendingAccept = nil
+            pendingAcceptNotif = false
+            resetCatchCycle('cancelled/taken')
+            notify(L'Заказ отменен/перехвачен, жду новый...', 0xFFAA00)
+            return
+        end
     end
 
-    if cleanN:find(L'нельзя принять заказ', 1, true)
-       or cleanN:find(L'уже выполняете заказ', 1, true) then
+    -- Подтверждение успешного взятия заказа (срабатывает ТОЛЬКО если мы реально принимали диалог заказа)
+    if pendingAccept and (cleanN:find(L'бонус таксиста', 1, true)
+       or cleanN:find(L'метка на карте', 1, true)
+       or cleanN:find(L'отправился к клиенту', 1, true)
+       or cleanN:find(L'вы приняли заказ', 1, true)) then
+       
         hasActiveOrder = true
         pendingAccept = nil
-        resetCatchCycle('already has order')
+        pendingAcceptNotif = false
+        awaitingDialog = false
+        tapSequenceActive = false
+        logAct('Order confirmed by server message')
+        notify(L'Заказ принят! Метка на карте', 0x00FF00)
         return
     end
 
@@ -946,10 +1007,20 @@ end
 -- ============================================================
 local function respondSoon(id, button, why)
     lua_thread.create(function()
-        wait(DIALOG_RESPONSE_WAIT)
+        -- Если турбо-ловля выключена, делаем задержку 40-90 мс. При турбо — 0 мс (сразу отправляем)
+        if not CFG.turboCatch then
+            wait(math.random(40, 90))
+        end
+        
         sampSendDialogResponse(id, button, 0, '')
-        logAct(string.format('SEND resp id=%s btn=%d (%s)',
-            tostring(id), button, tostring(why or '-')))
+        
+        -- Принудительно закрываем диалог на экране мобилки
+        if type(sampCloseCurrentDialogWithButton) == 'function' then
+            pcall(sampCloseCurrentDialogWithButton, button)
+        end
+        
+        logAct(string.format('SEND resp id=%s btn=%d (%s, turbo=%s)',
+            tostring(id), button, tostring(why or '-'), tostring(CFG.turboCatch)))
     end)
 end
 
@@ -978,24 +1049,30 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
                   or b1N == L'принять'
                   or (b1N:find(L'принять', 1, true) and b2N:find(L'закрыть', 1, true))
 
-    if awaitingDialog and os.clock() < awaitingExpire and isConfirm then
-        awaitingDialog = false
-        tapSequenceActive = false
-        hasActiveOrder = true
-        pendingAccept = os.clock()
-        pendingAcceptNotif = false
-        logAct('Order dialog accepted (tap scan)')
-        notify(L'Диалог найден, принимаю заказ', 0xFFFF00)
-        if CFG.autoAccept then
-            respondSoon(id, 1, 'accept')
-        end
-        return
+    -- 1. Если заказ УЖЕ подтвержден сервером (мы реально везем клиента), глушим диалоги
+    if hasActiveOrder and not pendingAccept and isConfirm then
+        logAct('Confirm dialog blocked (already in active order)')
+        return false
     end
 
-    if not awaitingDialog and isConfirm and b1N == L'принять' then
-        logAct('Repeat confirm - accept')
-        respondSoon(id, 1, 'accept-repeat')
-        return
+    -- 2. Ловим ЛЮБОЙ диалог подтверждения заказа (не ставим hasActiveOrder раньше времени!)
+    if isConfirm and b1N == L'принять' then
+        awaitingDialog = false
+        tapSequenceActive = false
+        
+        -- Принимаем заказ, если еще не в активной поездке
+        if not hasActiveOrder then
+            pendingAccept = os.clock()
+            pendingAcceptNotif = false
+            logAct('Order dialog accepted: ' .. tostring(id))
+            notify(L'Принимаю заказ...', 0xFFFF00)
+            if CFG.autoAccept then
+                respondSoon(id, 1, 'accept')
+            end
+        else
+            logAct('Duplicate confirm hidden')
+        end
+        return false -- Скрываем окно с экрана, ответ уходит в фоне
     end
 
     local isOrderLike = titleN:find(L'заказ', 1, true)
@@ -1013,7 +1090,7 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
         logAct('Order via dialog - accepting')
         notify(L'Принимаю заказ (диалог)', 0xFFFF00)
         respondSoon(id, 1, 'order-dialog')
-        return
+        return false -- Прячем диалог заказа
     end
 
     local is_error = titleN:find(L'ошибка', 1, true)
@@ -1021,13 +1098,15 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
 
     if is_error then
         if bodyN:find(L'заказ уже принят', 1, true)
-           or bodyN:find(L'заказ отмен', 1, true) then
+           or bodyN:find(L'заказ отмен', 1, true)
+           or bodyN:find(L'клиент отменил', 1, true) then
             logAct('Error: order already taken/cancelled')
             hasActiveOrder = false
             pendingAccept = nil
             pendingAcceptNotif = false
+            resetCatchCycle('dialog error cancel')
             respondSoon(id, 1, 'close-error')
-            return
+            return false -- Прячем ошибку
         end
         if bodyN:find(L'нельзя принять заказ', 1, true)
            or bodyN:find(L'уже выполняете', 1, true) then
@@ -1035,11 +1114,11 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
             pendingAccept = nil
             resetCatchCycle('already has order')
             respondSoon(id, 1, 'close-error')
-            return
+            return false -- Прячем ошибку
         end
         logAct('Closing error dialog')
         respondSoon(id, 1, 'close-error')
-        return
+        return false -- Прячем ошибку
     end
 
     logAct(string.format('Dialog id=%s ignored (b1=%s, b2=%s)',
@@ -1717,6 +1796,22 @@ local function OrdersTabFrame()
         if ToggleButton(u8(L'Авто-принять заказ'), tgAccept, 0.18) then
             CFG.autoAccept = tgAccept[0]; buf.autoAccept[0] = CFG.autoAccept; markDirty()
         end
+        imgui.Spacing()
+        tgTurbo[0] = CFG.turboCatch
+        if ToggleButton(u8(L'Турбо-ловля (0 мс)'), tgTurbo, 0.18) then
+            CFG.turboCatch = tgTurbo[0]; buf.turboCatch[0] = CFG.turboCatch; markDirty()
+            if CFG.turboCatch then
+                notify(L'Внимание: Турбо-ловля включена (0 мс)!', 0xFF0000)
+            end
+        end
+
+        if CFG.turboCatch then
+            imgui.Spacing()
+            if FONT_SUB then imgui.PushFont(FONT_SUB) end
+            imgui.TextColored(COL.red, u8(L'ВНИМАНИЕ: Задержка отключена!'))
+            imgui.TextWrapped(u8(L'Мгновенный ответ (0 мс) повышает риск бана за автокликер. Автор не несёт ответственности.'))
+            if FONT_SUB then imgui.PopFont() end
+        end
 
         imgui.Spacing(); Divider(); imgui.Spacing()
 
@@ -2179,7 +2274,9 @@ function main()
         end
 
         if pendingAccept and (now - pendingAccept) > PENDING_TIMEOUT and not pendingAcceptNotif then
-            hasActiveOrder = false; pendingAccept = nil; resetCatchCycle('accept timeout')
+            -- Сбрасываем только флаг ожидания ответа, но НЕ сбрасываем сам заказ!
+            pendingAccept = nil
+            resetCatchCycle('accept timeout')
         end
 
         if tapSequenceActive then
