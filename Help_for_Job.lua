@@ -1,10 +1,10 @@
 -- Help_for_Job.lua
 -- MonetLoader 3.8.x / MoonLoader
--- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам + исправление автообновления (30.10.2026)
--- v29.0.3
+-- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам + исправление автообновления (31.10.2026)
+-- v29.0.4
 
 script_name('HfJ')
-script_version('29.0.3')
+script_version('29.0.4')
 
 local imgui    = require 'mimgui'
 local new      = imgui.new
@@ -13,7 +13,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local sampev = require 'samp.events'
 
-local VERSION       = '29.0.3'
+local VERSION       = '29.0.4'
 local LOCAL_VERSION = VERSION
 
 -- ============================================================
@@ -56,11 +56,11 @@ end
 -- ============================================================
 --  КОНСТАНТЫ
 -- ============================================================
-local MAX_TAPS              = 30
-local TAP_STEP_MS           = 30
-local TAP_COOLDOWN          = 300
+local MAX_TAPS              = 12
+local TAP_STEP_MS           = 70
+local TAP_COOLDOWN          = 500
 local DIALOG_RESPONSE_WAIT  = 30
-local PENDING_TIMEOUT       = 6.0
+local PENDING_TIMEOUT       = 2.5
 
 local ORDER_PATTERNS = {
     L'поступил новый заказ',
@@ -608,7 +608,7 @@ doCheck = function(silent, thenDownload)
 
     updateDownloading = true
     updaterStatus = L'проверяю...'
-    if not silent then notify(L'Проверяю обновление на GitHub...', 0xFFFF00) end
+    if not silent then notify(L'Проверяю наличие обновлений...', 0xFFFF00) end
 
     lua_thread.create(function()
         local ok, body, err = pcall(fetchText, UPDATE_URL_VERSION, 15)
@@ -679,7 +679,7 @@ doUpdate = function()
         if not body:find('script_name', 1, true) then
             updaterStatus = L'это не скрипт'
             logAct('Download rejected: no script_name')
-            notify(L'На GitHub лежит не скрипт', 0xFF0000)
+            notify(L'Ошибка содержимого файла обновления', 0xFF0000)
             return
         end
 
@@ -987,16 +987,13 @@ function sampev.onServerMessage(color, text)
             if (os.clock() * 1000) < lastTapTime + TAP_COOLDOWN then return end
             lastTapTime = os.clock() * 1000
             awaitingDialog = true
-            awaitingExpire = os.clock() + 6
+            awaitingExpire = os.clock() + 1.5
             tapSequenceActive = true
             tapSeqIndex = 1
             tapSeqRejected = {}
 
-            sendTapPacketWithIndex(0)
-            logAct('Tap sent: index=0 (instant)')
-
-            tapSeqNextSend = os.clock() + TAP_STEP_MS / 1000
-            logAct('New order (chat) - start scanning')
+            tapSeqNextSend = os.clock() + (math.random(50, 90) / 1000)
+            logAct('New order (chat) - queue scanning')
             notify(L'Новый заказ, ищу...', 0xFFFF00)
         end
     end
@@ -1007,9 +1004,9 @@ end
 -- ============================================================
 local function respondSoon(id, button, why)
     lua_thread.create(function()
-        -- Если турбо-ловля выключена, делаем задержку 40-90 мс. При турбо — 0 мс (сразу отправляем)
+        -- Безопасная задержка человеческой реакции (180-320 мс)
         if not CFG.turboCatch then
-            wait(math.random(40, 90))
+            wait(math.random(180, 320))
         end
         
         sampSendDialogResponse(id, button, 0, '')
@@ -1045,34 +1042,31 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
         return
     end
 
-    local isConfirm = titleN:find(L'подтверждение', 1, true)
-                  or b1N == L'принять'
-                  or (b1N:find(L'принять', 1, true) and b2N:find(L'закрыть', 1, true))
+    -- Проверка: является ли диалог реальным заказом такси
+    local isRealTaxiOrder = bodyN:find(normalize(L'имя:'), 1, true) 
+                         or bodyN:find(normalize(L'класс авто:'), 1, true)
+                         or bodyN:find(normalize(L'пункт назначения:'), 1, true)
 
-    -- 1. Если заказ УЖЕ подтвержден сервером (мы реально везем клиента), глушим диалоги
-    if hasActiveOrder and not pendingAccept and isConfirm then
-        logAct('Confirm dialog blocked (already in active order)')
-        return false
-    end
+    if isRealTaxiOrder then
+        -- Если мы уже в заказе ИЛИ прямо сейчас отправлен ответ на предыдущий заказ — глушим второй диалог
+        if hasActiveOrder or pendingAccept then
+            logAct('Duplicate taxi dialog blocked (already active/pending)')
+            return false
+        end
 
-    -- 2. Ловим ЛЮБОЙ диалог подтверждения заказа (не ставим hasActiveOrder раньше времени!)
-    if isConfirm and b1N == L'принять' then
-        awaitingDialog = false
-        tapSequenceActive = false
-        
-        -- Принимаем заказ, если еще не в активной поездке
-        if not hasActiveOrder then
+        -- Принимаем реальный заказ такси
+        if CFG.catchEnabled and b1N == L'принять' then
+            awaitingDialog = false
+            tapSequenceActive = false
             pendingAccept = os.clock()
             pendingAcceptNotif = false
-            logAct('Order dialog accepted: ' .. tostring(id))
+            logAct('Real order dialog accepted: ' .. tostring(id))
             notify(L'Принимаю заказ...', 0xFFFF00)
             if CFG.autoAccept then
                 respondSoon(id, 1, 'accept')
             end
-        else
-            logAct('Duplicate confirm hidden')
+            return false
         end
-        return false -- Скрываем окно с экрана, ответ уходит в фоне
     end
 
     local isOrderLike = titleN:find(L'заказ', 1, true)
@@ -1504,44 +1498,6 @@ local function GlassWindow(title, var, closeButton, leftSize, tabs, flags)
             end
         end
 
-        -- Статус-пилюля в шапке
-        do
-            local pulse = 0.55 + 0.45 * math.sin(os.clock() * 3.0)
-            local stxt  = hasActiveOrder and u8(L'В заказе') or u8(L'Свободен')
-            local scol  = hasActiveOrder and COL.green or COL.dim
-
-            if FONT_SUB then imgui.PushFont(FONT_SUB) end
-            local sts = imgui.CalcTextSize(stxt)
-            local ph  = sts.y + SC(12)
-            local pw  = sts.x + SC(42)
-            local px  = pos.x + wsize.x - pw - SC(18)
-            local py  = pos.y + SC(16)
-
-            DL:AddRectFilled(imgui.ImVec2(px, py), imgui.ImVec2(px + pw, py + ph),
-                C(imgui.ImVec4(scol.x, scol.y, scol.z, 0.13 * a)), ph / 2)
-            DL:AddRect(imgui.ImVec2(px, py), imgui.ImVec2(px + pw, py + ph),
-                C(imgui.ImVec4(scol.x, scol.y, scol.z, 0.40 * a)), ph / 2, 0, SC(1))
-            DL:AddCircleFilled(imgui.ImVec2(px + SC(16), py + ph / 2), SC(4),
-                C(imgui.ImVec4(scol.x, scol.y, scol.z, pulse)))
-            DL:AddText(imgui.ImVec2(px + SC(28), py + (ph - sts.y) / 2),
-                C(imgui.ImVec4(0.84, 0.88, 0.93, 1.0)), stxt)
-
-            -- Версия слева от статуса: видна всегда
-            local vtxt = 'v' .. LOCAL_VERSION
-            local vts  = imgui.CalcTextSize(vtxt)
-            local vw   = vts.x + SC(26)
-            local vh   = vts.y + SC(12)
-            local vx   = px - vw - SC(16)
-            local vy   = py
-
-            DL:AddRectFilled(imgui.ImVec2(vx, vy), imgui.ImVec2(vx + vw, vy + vh),
-                C(imgui.ImVec4(1.0, 0.78, 0.05, 0.10 * a)), vh / 2)
-            DL:AddRect(imgui.ImVec2(vx, vy), imgui.ImVec2(vx + vw, vy + vh),
-                C(imgui.ImVec4(1.0, 0.78, 0.05, 0.35 * a)), vh / 2, 0, SC(1))
-            DL:AddText(imgui.ImVec2(vx + SC(13), vy + (vh - vts.y) / 2),
-                C(imgui.ImVec4(1.00, 0.88, 0.42, 1.0)), vtxt)
-            if FONT_SUB then imgui.PopFont() end
-        end
 
         -- Кнопка закрытия
         do
@@ -1951,7 +1907,7 @@ local function InfoTabFrame()
         imgui.Spacing()
         imgui.TextWrapped(u8(L'Счётчик ЗП учитывает выплаты по работам (такси, дальнобойщик, инкассатор) только после реального проезда.'))
         imgui.Spacing()
-        imgui.TextWrapped(u8(L'Обновление: проверка версии с GitHub и установка одной кнопкой.'))
+        imgui.TextWrapped(u8(L'Обновление: автоматическая проверка новых версий и установка в один клик.'))
         if FONT_SUB then imgui.PopFont() end
     end)
 
@@ -1982,9 +1938,9 @@ tabsList.tabs = {
     {
         name = 'HfJ',
         list = {
-            { name = u8(L'Заказы'), icon = '', frame = OrdersTabFrame },
-            { name = u8(L'ЗП'),     icon = '', frame = ZpTabFrame     },
-            { name = u8(L'Инфо'),   icon = '', frame = InfoTabFrame   },
+            { name = u8(L'Такси'),        icon = '', frame = OrdersTabFrame },
+            { name = u8(L'Счетчик ЗП'),   icon = '', frame = ZpTabFrame     },
+            { name = u8(L'Инфо'),         icon = '', frame = InfoTabFrame   },
         }
     }
 }
@@ -2194,7 +2150,7 @@ function main()
     sampRegisterChatCommand('update', function() doUpdate() end)
     sampRegisterChatCommand('updinfo', function()
         notify(L'Версия: v' .. LOCAL_VERSION ..
-            ' | GitHub: v' .. (remoteVersion ~= '' and remoteVersion or '?'), 0xFFFF00)
+            ' | Актуальная: v' .. (remoteVersion ~= '' and remoteVersion or '?'), 0xFFFF00)
         notify(L'Транспорты: ' .. updaterTransportsText(), 0xFFFF00)
         notify(L'Статус: ' .. updaterStatus, 0xFFFF00)
     end)
@@ -2293,12 +2249,15 @@ function main()
                 end
                 if not found then
                     tapSequenceActive = false
+                    awaitingDialog = false
                 else
                     tapSeqNextSend = now + TAP_STEP_MS / 1000
                 end
-            end
+            end -- ВОТ ЭТОТ END БЫЛ ПРОПУЩЕН
+
             if awaitingDialog and now > awaitingExpire then
-                awaitingDialog = false; tapSequenceActive = false
+                awaitingDialog = false
+                tapSequenceActive = false
             end
         end
     end
