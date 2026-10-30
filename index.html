@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Help for Job (HfJ) | Помощник для Arizona RP Mobile</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cabinet+Grotesk:wght@800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #090a0f;
+            --card-bg: rgba(18, 20, 26, 0.72);
+            --card-border: rgba(255, 255, 255, 0.08);
+            --accent: #ffc70d;
+            --accent-glow: rgba(255, 199, 13, 0.35);
+            --accent-grad: linear-gradient(135deg, #ffc70d 0%, #ff9800 100%);
+            --text-main: #f4f6fb;
+            --text-dim: #8f9ba8;
+            --danger: #ef4444;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg);
+            color: var(--text-main);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            line-height: 1.6;
+            overflow-x: hidden;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* Фоновые градиентные сферы */
+        .ambient-glow {
+            position: fixed;
+            border-radius: 50%;
+            filter: blur(140px);
+            z-index: -1;
+            opacity: 0.18;
+            pointer-events: none;
+            animation: pulse-glow 9s ease-in-out infinite alternate;
+        }
+
+        .glow-top {
+            top: -150px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 650px;
+            height: 450px;
+            background: var(--accent);
+        }
+
+        .glow-bottom {
+            bottom: -200px;
+            right: -100px;
+            width: 500px;
+            height: 500px;
+            background: #ff5722;
+        }
+
+        @keyframes pulse-glow {
+            0% { transform: translateX(-50%) scale(0.9); opacity: 0.14; }
+            100% { transform: translateX(-50%) scale(1.1); opacity: 0.22; }
+        }
+
+        .container {
+            max-width: 1080px;
+            margin: 0 auto;
+            padding: 40px 24px 80px;
+        }
+
+        /* Шапка */
+        .header {
+            text-align: center;
+            margin: 40px 0 70px;
+        }
+
+        .tag-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(255, 199, 13, 0.08);
+            border: 1px solid rgba(255, 199, 13, 0.25);
+            color: var(--accent);
+            padding: 6px 16px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            margin-bottom: 24px;
+            box-shadow: 0 0 20px rgba(255, 199, 13, 0.1);
+        }
+
+        .tag-pill .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--accent);
+            box-shadow: 0 0 8px var(--accent);
+        }
+
+        .title {
+            font-family: 'Cabinet Grotesk', 'Inter', sans-serif;
+            font-size: clamp(40px, 7vw, 68px);
+            font-weight: 800;
+            line-height: 1.08;
+            margin: 0 0 20px;
+            letter-spacing: -1.5px;
+        }
+
+        .title span {
+            background: var(--accent-grad);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-shadow: 0 0 40px rgba(255, 199, 13, 0.2);
+        }
+
+        .subtitle {
+            color: var(--text-dim);
+            font-size: clamp(16px, 2.5vw, 20px);
+            max-width: 620px;
+            margin: 0 auto;
+            font-weight: 400;
+        }
+
+        /* Карточки */
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 20px;
+            margin-bottom: 70px;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 20px;
+            padding: 28px;
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            transition: all 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .card:hover {
+            transform: translateY(-4px);
+            border-color: rgba(255, 199, 13, 0.3);
+            box-shadow: 0 16px 36px rgba(0, 0, 0, 0.4), 0 0 28px rgba(255, 199, 13, 0.08);
+        }
+
+        .card-icon {
+            width: 44px;
+            height: 44px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            background: rgba(255, 199, 13, 0.1);
+            border-radius: 12px;
+            border: 1px solid rgba(255, 199, 13, 0.2);
+            margin-bottom: 20px;
+        }
+
+        .card h3 {
+            margin: 0 0 10px;
+            font-size: 19px;
+            font-weight: 700;
+            color: #fff;
+        }
+
+        .card p {
+            margin: 0;
+            color: var(--text-dim);
+            font-size: 14.5px;
+            line-height: 1.6;
+        }
+
+        /* Секция скачивания */
+        .download-box {
+            background: linear-gradient(180deg, rgba(24, 27, 36, 0.75) 0%, rgba(15, 17, 23, 0.85) 100%);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 26px;
+            padding: 50px 32px;
+            text-align: center;
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+            position: relative;
+        }
+
+        .download-box h2 {
+            font-size: clamp(26px, 4vw, 34px);
+            font-weight: 700;
+            margin: 0 0 12px;
+        }
+
+        .download-box p {
+            color: var(--text-dim);
+            font-size: 16px;
+            margin: 0 0 32px;
+        }
+
+        .action-row {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            padding: 15px 28px;
+            border-radius: 14px;
+            font-size: 15px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.25s ease;
+            cursor: pointer;
+        }
+
+        .btn-primary {
+            background: var(--accent-grad);
+            color: #101114;
+            box-shadow: 0 10px 24px rgba(255, 199, 13, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.25);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 14px 30px rgba(255, 199, 13, 0.45);
+        }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-main);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+        }
+
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.22);
+            transform: translateY(-2px);
+        }
+
+        .btn-secondary svg {
+            fill: currentColor;
+            width: 18px;
+            height: 18px;
+            transition: transform 0.2s;
+        }
+
+        .btn-secondary:hover svg {
+            transform: scale(1.1);
+        }
+
+        .bug-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            margin-top: 24px;
+            color: #f87171;
+            background: rgba(239, 68, 68, 0.08);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+            padding: 11px 22px;
+            border-radius: 12px;
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+        .bug-link:hover {
+            background: rgba(239, 68, 68, 0.16);
+            border-color: rgba(239, 68, 68, 0.38);
+            color: #fca5a5;
+            transform: translateY(-1px);
+        }
+
+        @media (max-width: 600px) {
+            .container { padding: 30px 16px 60px; }
+            .btn { width: 100%; }
+            .action-row { flex-direction: column; }
+            .bug-link { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <div class="ambient-glow glow-top"></div>
+    <div class="ambient-glow glow-bottom"></div>
+
+    <div class="container">
+        <header class="header">
+            <div class="tag-pill">
+                <span class="dot"></span> ARIZONA RP MOBILE · LUA
+            </div>
+            <h1 class="title">HELP FOR <span>JOB</span></h1>
+            <p class="subtitle">Умный скрипт для автоматизации заказов и прозрачного учета заработка на мобильных серверах.</p>
+        </header>
+
+        <section class="features">
+            <div class="card">
+                <div class="card-icon">⚡</div>
+                <h3>Автоловля заказов</h3>
+                <p>Перехватывает заказы через диалоги и чат с естественными задержками клика без риска для аккаунта.</p>
+            </div>
+            <div class="card">
+                <div class="card-icon">💰</div>
+                <h3>Счётчик зарплаты</h3>
+                <p>Раздельный учет для Такси, Дальнобойщиков и Инкассаторов с валидацией через пройденную дистанцию.</p>
+            </div>
+            <div class="card">
+                <div class="card-icon">🛡️</div>
+                <h3>Защита баланса</h3>
+                <p>Полная блокировка случайных оплат — скрипт игнорирует любые всплывающие окна с комиссиями и :CASH:.</p>
+            </div>
+            <div class="card">
+                <div class="card-icon">🔄</div>
+                <h3>OTA Обновления</h3>
+                <p>Проверка релизов напрямую с GitHub и обновление скрипта прямо во время игры в один тап.</p>
+            </div>
+        </section>
+
+        <section class="download-box">
+            <h2>Начни работать эффективнее</h2>
+            <p>Для работы требуется MoonLoader или MonetLoader.</p>
+            
+            <div class="action-row">
+                <a href="https://github.com/hshajqk710-glitch/Help-for-Job/releases" class="btn btn-primary">Скачать HfJ</a>
+                
+                <a href="https://github.com/hshajqk710-glitch/Help-for-Job" class="btn btn-secondary">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"></path>
+                    </svg>
+                    Исходный код (GitHub)
+                </a>
+            </div>
+
+            <div>
+                <a href="https://docs.google.com/forms/d/e/1FAIpQLSforWXak0MWrzJzng8awgZL75heZqCeklF5abC10rlPJ7X1kg/viewform?usp=dialog" target="_blank" class="bug-link">
+                    🐛 Нашли баг? Напишите нам
+                </a>
+            </div>
+        </section>
+    </div>
+</body>
+</html>
