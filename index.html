@@ -3,355 +3,708 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Help for Job (HfJ) | Помощник для Arizona RP Mobile</title>
+    <title>Help for Job (HfJ) — Центр загрузки</title>
+    <meta name="description" content="Официальная страница загрузки Help for Job (HfJ) в стиле Automotive Dashboard.">
+    <meta property="og:title" content="Help for Job (HfJ) — Центр загрузки">
+    <meta property="og:description" content="Официальная страница загрузки Help for Job (HfJ) в стиле Automotive Dashboard.">
+    <meta property="og:type" content="website">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Cabinet+Grotesk:wght@800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg: #090a0f;
-            --card-bg: rgba(18, 20, 26, 0.72);
-            --card-border: rgba(255, 255, 255, 0.08);
-            --accent: #ffc70d;
-            --accent-glow: rgba(255, 199, 13, 0.35);
-            --accent-grad: linear-gradient(135deg, #ffc70d 0%, #ff9800 100%);
-            --text-main: #f4f6fb;
-            --text-dim: #8f9ba8;
-            --danger: #ef4444;
+            --canvas: #121418;
+            --surface: #1A1C21;
+            --bar: #131519;
+            --card: #21242B;
+            --card-dark: #17191E;
+            --tile-hover: #292D36;
+            --accent: #00CCB3;
+            --accent-bright: #1CE6CC;
+            --accent-dark: #0A8C7D;
+            --emerald: #20DC88;
+            --text: #F0F3F8;
+            --dim: #8D98A6;
+            --danger: #EB525E;
+            --shadow-dark: rgba(5, 6, 9, 0.78);
+            --border-subtle: rgba(255, 255, 255, 0.06);
         }
 
         * {
             box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        html, body {
+            min-height: 100%;
         }
 
         body {
-            margin: 0;
-            padding: 0;
-            background-color: var(--bg);
-            color: var(--text-main);
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-            line-height: 1.6;
-            overflow-x: hidden;
+            background-color: var(--canvas);
+            background-image:
+                radial-gradient(900px 460px at 50% -10%, rgba(0, 204, 179, 0.11), transparent 65%),
+                radial-gradient(640px 420px at 88% 105%, rgba(32, 220, 136, 0.08), transparent 65%);
+            color: var(--text);
+            font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            line-height: 1.55;
             -webkit-font-smoothing: antialiased;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 36px 18px 44px;
+            overflow-x: hidden;
         }
 
-        /* Фоновые градиентные сферы */
-        .ambient-glow {
+        /* Декоративная сетка на заднем плане */
+        .bg-grid {
             position: fixed;
-            border-radius: 50%;
-            filter: blur(140px);
-            z-index: -1;
-            opacity: 0.18;
+            inset: 0;
             pointer-events: none;
-            animation: pulse-glow 9s ease-in-out infinite alternate;
+            z-index: -1;
+            background-image:
+                linear-gradient(to right, rgba(255, 255, 255, 0.022) 1px, transparent 1px),
+                linear-gradient(to bottom, rgba(255, 255, 255, 0.022) 1px, transparent 1px);
+            background-size: 48px 48px;
+            mask-image: radial-gradient(circle at 50% 40%, black 25%, transparent 80%);
+            -webkit-mask-image: radial-gradient(circle at 50% 40%, black 25%, transparent 80%);
         }
 
-        .glow-top {
-            top: -150px;
-            left: 50%;
-            transform: translateX(-50%);
-            width: 650px;
-            height: 450px;
-            background: var(--accent);
+        .page {
+            width: 100%;
+            max-width: 780px;
+            display: flex;
+            flex-direction: column;
+            gap: 28px;
+            animation: page-in 0.55s cubic-bezier(0.2, 0.8, 0.2, 1) both;
         }
 
-        .glow-bottom {
-            bottom: -200px;
-            right: -100px;
-            width: 500px;
-            height: 500px;
-            background: #ff5722;
+        @keyframes page-in {
+            from { opacity: 0; transform: translateY(14px); }
+            to { opacity: 1; transform: translateY(0); }
         }
 
-        @keyframes pulse-glow {
-            0% { transform: translateX(-50%) scale(0.9); opacity: 0.14; }
-            100% { transform: translateX(-50%) scale(1.1); opacity: 0.22; }
-        }
-
-        .container {
-            max-width: 1080px;
-            margin: 0 auto;
-            padding: 40px 24px 80px;
-        }
-
-        /* Шапка */
-        .header {
+        /* Верхний заголовок над консолью */
+        .hero {
             text-align: center;
-            margin: 40px 0 70px;
+            padding: 4px 8px 0;
         }
 
-        .tag-pill {
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 9px;
+            background: var(--card);
+            border: 1px solid rgba(0, 204, 179, 0.28);
+            border-radius: 12px;
+            padding: 7px 14px;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--accent-bright);
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+            margin-bottom: 18px;
+        }
+
+        .hero-badge .pulse-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--emerald);
+            box-shadow: 0 0 0 0 rgba(32, 220, 136, 0.6);
+            animation: pulse 2.1s infinite;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(32, 220, 136, 0.55); }
+            70% { box-shadow: 0 0 0 7px rgba(32, 220, 136, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(32, 220, 136, 0); }
+        }
+
+        .hero h1 {
+            font-size: clamp(36px, 6.5vw, 56px);
+            font-weight: 800;
+            letter-spacing: -0.03em;
+            line-height: 1.06;
+            margin-bottom: 12px;
+            color: var(--text);
+        }
+
+        .hero h1 span {
+            background: linear-gradient(125deg, var(--accent-bright) 0%, var(--emerald) 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .hero p {
+            font-size: clamp(15px, 2.2vw, 17px);
+            color: var(--dim);
+            max-width: 500px;
+            margin: 0 auto;
+        }
+
+        /* Главная матовая панель в стиле HfJ Automotive Dashboard */
+        .dashboard {
+            background: var(--surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: 22px;
+            overflow: hidden;
+            box-shadow:
+                0 26px 60px var(--shadow-dark),
+                0 2px 6px rgba(0, 0, 0, 0.4),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05);
+        }
+
+        /* Шапка панели */
+        .dash-header {
+            background: var(--bar);
+            border-bottom: 1px solid var(--border-subtle);
+            padding: 14px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 11px;
+        }
+
+        .brand-emblem {
+            width: 44px;
+            height: 38px;
+            border-radius: 11px;
+            background: linear-gradient(155deg, var(--accent-bright) 0%, var(--emerald) 55%, var(--accent-dark) 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 16px;
+            color: #081210;
+            letter-spacing: -0.02em;
+            position: relative;
+            box-shadow:
+                0 4px 14px rgba(0, 204, 179, 0.28),
+                inset 0 1px 1px rgba(255, 255, 255, 0.45);
+        }
+
+        .brand-text {
+            display: flex;
+            flex-direction: column;
+            line-height: 1.15;
+        }
+
+        .brand-text strong {
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            color: var(--text);
+        }
+
+        .brand-text span {
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--accent-bright);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .dash-title {
+            font-size: 15px;
+            font-weight: 700;
+            color: var(--text);
+            letter-spacing: 0.01em;
+        }
+
+        .status-chip {
             display: inline-flex;
             align-items: center;
             gap: 8px;
-            background: rgba(255, 199, 13, 0.08);
-            border: 1px solid rgba(255, 199, 13, 0.25);
-            color: var(--accent);
-            padding: 6px 16px;
+            background: linear-gradient(135deg, rgba(16, 61, 43, 0.92), rgba(22, 77, 54, 0.92));
+            border: 1px solid rgba(32, 220, 136, 0.55);
             border-radius: 999px;
-            font-size: 13px;
+            padding: 6px 13px;
+            font-size: 12.5px;
             font-weight: 600;
-            letter-spacing: 0.5px;
-            margin-bottom: 24px;
-            box-shadow: 0 0 20px rgba(255, 199, 13, 0.1);
+            color: var(--text);
+            white-space: nowrap;
         }
 
-        .tag-pill .dot {
-            width: 6px;
-            height: 6px;
+        .status-chip .dot {
+            width: 8px;
+            height: 8px;
             border-radius: 50%;
-            background: var(--accent);
-            box-shadow: 0 0 8px var(--accent);
+            background: var(--emerald);
+            box-shadow: 0 0 10px var(--emerald);
         }
 
-        .title {
-            font-family: 'Cabinet Grotesk', 'Inter', sans-serif;
-            font-size: clamp(40px, 7vw, 68px);
-            font-weight: 800;
-            line-height: 1.08;
-            margin: 0 0 20px;
-            letter-spacing: -1.5px;
+        /* Контент панели */
+        .dash-body {
+            padding: 22px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
         }
 
-        .title span {
-            background: var(--accent-grad);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            text-shadow: 0 0 40px rgba(255, 199, 13, 0.2);
-        }
-
-        .subtitle {
-            color: var(--text-dim);
-            font-size: clamp(16px, 2.5vw, 20px);
-            max-width: 620px;
-            margin: 0 auto;
-            font-weight: 400;
-        }
-
-        /* Карточки */
-        .features {
+        /* Инфо-плитки (нейтральные технические данные) */
+        .meta-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-            gap: 20px;
-            margin-bottom: 70px;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
         }
 
-        .card {
-            background: var(--card-bg);
-            border: 1px solid var(--card-border);
-            border-radius: 20px;
-            padding: 28px;
-            backdrop-filter: blur(16px);
-            -webkit-backdrop-filter: blur(16px);
-            transition: all 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .card:hover {
-            transform: translateY(-4px);
-            border-color: rgba(255, 199, 13, 0.3);
-            box-shadow: 0 16px 36px rgba(0, 0, 0, 0.4), 0 0 28px rgba(255, 199, 13, 0.08);
-        }
-
-        .card-icon {
-            width: 44px;
-            height: 44px;
+        .meta-card {
+            background: var(--card);
+            border: 1px solid rgba(255, 255, 255, 0.045);
+            border-radius: 15px;
+            padding: 15px 16px;
+            box-shadow:
+                0 8px 18px rgba(0, 0, 0, 0.32),
+                inset 0 1px 0 rgba(255, 255, 255, 0.04);
             display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 22px;
-            background: rgba(255, 199, 13, 0.1);
-            border-radius: 12px;
-            border: 1px solid rgba(255, 199, 13, 0.2);
-            margin-bottom: 20px;
+            flex-direction: column;
+            gap: 4px;
+            transition: transform 0.2s ease, border-color 0.2s ease, background-color 0.2s ease;
         }
 
-        .card h3 {
-            margin: 0 0 10px;
-            font-size: 19px;
-            font-weight: 700;
-            color: #fff;
+        .meta-card:hover {
+            transform: translateY(-2px);
+            background: var(--tile-hover);
+            border-color: rgba(0, 204, 179, 0.28);
         }
 
-        .card p {
-            margin: 0;
-            color: var(--text-dim);
-            font-size: 14.5px;
-            line-height: 1.6;
+        .meta-label {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--dim);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
         }
 
-        /* Секция скачивания */
-        .download-box {
-            background: linear-gradient(180deg, rgba(24, 27, 36, 0.75) 0%, rgba(15, 17, 23, 0.85) 100%);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 26px;
-            padding: 50px 32px;
-            text-align: center;
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
-            position: relative;
-        }
-
-        .download-box h2 {
-            font-size: clamp(26px, 4vw, 34px);
-            font-weight: 700;
-            margin: 0 0 12px;
-        }
-
-        .download-box p {
-            color: var(--text-dim);
+        .meta-value {
             font-size: 16px;
-            margin: 0 0 32px;
+            font-weight: 700;
+            color: var(--text);
         }
 
-        .action-row {
+        .meta-value.mono {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--accent-bright);
+        }
+
+        /* Главная кнопка-плашка скачивания в стиле плашки в приложении */
+        .download-bar {
+            position: relative;
             display: flex;
-            flex-wrap: wrap;
-            justify-content: center;
             align-items: center;
-            gap: 14px;
+            justify-content: space-between;
+            gap: 18px;
+            padding: 22px 24px;
+            border-radius: 18px;
+            text-decoration: none;
+            color: var(--text);
+            background: linear-gradient(125deg, #0E3B2B 0%, #12523B 45%, #0D4B45 100%);
+            border: 1px solid rgba(32, 220, 136, 0.55);
+            box-shadow:
+                0 14px 30px rgba(0, 0, 0, 0.45),
+                0 0 28px rgba(32, 220, 136, 0.14),
+                inset 0 1px 0 rgba(140, 255, 220, 0.25);
+            overflow: hidden;
+            transition: transform 0.22s ease, box-shadow 0.22s ease, border-color 0.22s ease;
         }
 
-        .btn {
+        .download-bar::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -45%;
+            width: 45%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(32, 220, 136, 0.14), transparent);
+            animation: bar-shimmer 4.2s ease-in-out infinite;
+            pointer-events: none;
+        }
+
+        @keyframes bar-shimmer {
+            0% { left: -45%; }
+            55%, 100% { left: 120%; }
+        }
+
+        .download-bar:hover {
+            transform: translateY(-2px);
+            border-color: var(--accent-bright);
+            box-shadow:
+                0 18px 38px rgba(0, 0, 0, 0.52),
+                0 0 36px rgba(28, 230, 204, 0.24),
+                inset 0 1px 0 rgba(160, 255, 230, 0.35);
+        }
+
+        .download-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            z-index: 1;
+        }
+
+        .download-icon-circle {
+            width: 52px;
+            height: 52px;
+            border-radius: 15px;
+            background: linear-gradient(135deg, var(--emerald), var(--accent-bright));
+            color: #061310;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            box-shadow: 0 6px 18px rgba(32, 220, 136, 0.35);
+        }
+
+        .download-icon-circle svg {
+            width: 24px;
+            height: 24px;
+        }
+
+        .download-copy {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .download-copy strong {
+            font-size: 20px;
+            font-weight: 800;
+            letter-spacing: -0.01em;
+            color: #FFFFFF;
+        }
+
+        .download-copy span {
+            font-size: 13.5px;
+            color: #98F5CF;
+            font-weight: 500;
+        }
+
+        .download-cta {
+            z-index: 1;
             display: inline-flex;
             align-items: center;
-            justify-content: center;
-            gap: 10px;
-            padding: 15px 28px;
-            border-radius: 14px;
-            font-size: 15px;
-            font-weight: 600;
+            gap: 8px;
+            padding: 11px 18px;
+            border-radius: 12px;
+            background: rgba(11, 20, 18, 0.65);
+            border: 1px solid rgba(32, 220, 136, 0.45);
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--accent-bright);
+            white-space: nowrap;
+            transition: background-color 0.2s ease, transform 0.2s ease;
+        }
+
+        .download-bar:hover .download-cta {
+            background: rgba(11, 20, 18, 0.85);
+            transform: translateX(2px);
+        }
+
+        /* Вторичные кнопки действий */
+        .secondary-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .action-tile {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 16px 18px;
+            border-radius: 15px;
             text-decoration: none;
-            transition: all 0.25s ease;
-            cursor: pointer;
+            background: var(--card);
+            border: 1px solid rgba(255, 255, 255, 0.055);
+            color: var(--text);
+            box-shadow:
+                0 8px 18px rgba(0, 0, 0, 0.32),
+                inset 0 1px 0 rgba(255, 255, 255, 0.04);
+            transition: transform 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
         }
 
-        .btn-primary {
-            background: var(--accent-grad);
-            color: #101114;
-            box-shadow: 0 10px 24px rgba(255, 199, 13, 0.3);
-            border: 1px solid rgba(255, 255, 255, 0.25);
-        }
-
-        .btn-primary:hover {
+        .action-tile:hover {
             transform: translateY(-2px);
-            box-shadow: 0 14px 30px rgba(255, 199, 13, 0.45);
+            background: var(--tile-hover);
+            border-color: rgba(0, 204, 179, 0.35);
         }
 
-        .btn-secondary {
-            background: rgba(255, 255, 255, 0.05);
-            color: var(--text-main);
-            border: 1px solid rgba(255, 255, 255, 0.12);
+        .action-tile.bug:hover {
+            border-color: rgba(235, 82, 94, 0.45);
+            background: #281F23;
         }
 
-        .btn-secondary:hover {
-            background: rgba(255, 255, 255, 0.1);
-            border-color: rgba(255, 255, 255, 0.22);
-            transform: translateY(-2px);
+        .action-tile-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
         }
 
-        .btn-secondary svg {
-            fill: currentColor;
+        .action-icon {
+            width: 38px;
+            height: 38px;
+            border-radius: 11px;
+            background: var(--card-dark);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            color: var(--accent-bright);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .action-tile.bug .action-icon {
+            color: var(--danger);
+            border-color: rgba(235, 82, 94, 0.22);
+        }
+
+        .action-icon svg {
             width: 18px;
             height: 18px;
-            transition: transform 0.2s;
         }
 
-        .btn-secondary:hover svg {
-            transform: scale(1.1);
+        .action-text {
+            display: flex;
+            flex-direction: column;
         }
 
-        .bug-link {
-            display: inline-flex;
+        .action-text strong {
+            font-size: 14.5px;
+            font-weight: 700;
+            color: var(--text);
+        }
+
+        .action-text span {
+            font-size: 12.5px;
+            color: var(--dim);
+        }
+
+        .arrow {
+            color: var(--dim);
+            font-size: 16px;
+            transition: transform 0.2s ease, color 0.2s ease;
+        }
+
+        .action-tile:hover .arrow {
+            transform: translateX(3px);
+            color: var(--text);
+        }
+
+        /* Нижняя панель консоли */
+        .dash-footer {
+            background: var(--bar);
+            border-top: 1px solid var(--border-subtle);
+            padding: 13px 22px;
+            display: flex;
             align-items: center;
-            justify-content: center;
+            justify-content: space-between;
+            gap: 12px;
+            font-size: 12.5px;
+            color: var(--dim);
+        }
+
+        .dash-footer-note {
+            display: flex;
+            align-items: center;
             gap: 8px;
-            margin-top: 24px;
-            color: #f87171;
-            background: rgba(239, 68, 68, 0.08);
-            border: 1px solid rgba(239, 68, 68, 0.2);
-            padding: 11px 22px;
-            border-radius: 12px;
-            text-decoration: none;
-            font-size: 14px;
-            font-weight: 500;
-            transition: all 0.2s;
         }
 
-        .bug-link:hover {
-            background: rgba(239, 68, 68, 0.16);
-            border-color: rgba(239, 68, 68, 0.38);
-            color: #fca5a5;
-            transform: translateY(-1px);
+        .dash-footer-note .accent-bar {
+            width: 18px;
+            height: 3px;
+            border-radius: 2px;
+            background: var(--accent);
         }
 
-        @media (max-width: 600px) {
-            .container { padding: 30px 16px 60px; }
-            .btn { width: 100%; }
-            .action-row { flex-direction: column; }
-            .bug-link { width: 100%; }
+        @media (max-width: 680px) {
+            body {
+                padding: 24px 14px 36px;
+                justify-content: flex-start;
+            }
+
+            .dash-header {
+                padding: 12px 16px;
+            }
+
+            .dash-title {
+                display: none;
+            }
+
+            .dash-body {
+                padding: 16px;
+            }
+
+            .meta-grid {
+                grid-template-columns: 1fr;
+                gap: 10px;
+            }
+
+            .meta-card {
+                flex-direction: row;
+                align-items: center;
+                justify-content: space-between;
+                padding: 13px 15px;
+            }
+
+            .download-bar {
+                flex-direction: column;
+                align-items: stretch;
+                padding: 18px;
+            }
+
+            .download-cta {
+                justify-content: center;
+            }
+
+            .secondary-row {
+                grid-template-columns: 1fr;
+            }
+
+            .dash-footer {
+                flex-direction: column;
+                align-items: flex-start;
+                padding: 12px 16px;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="ambient-glow glow-top"></div>
-    <div class="ambient-glow glow-bottom"></div>
+    <div class="bg-grid" aria-hidden="true"></div>
 
-    <div class="container">
-        <header class="header">
-            <div class="tag-pill">
-                <span class="dot"></span> ARIZONA RP MOBILE · LUA
+    <main class="page">
+        <header class="hero">
+            <div class="hero-badge">
+                <span class="pulse-dot"></span>
+                <span>ARIZONA MOBILE · LUA</span>
             </div>
-            <h1 class="title">HELP FOR <span>JOB</span></h1>
-            <p class="subtitle">Умный скрипт для автоматизации заказов и прозрачного учета заработка на мобильных серверах.</p>
+            <h1>HELP FOR <span>JOB</span></h1>
+            <p>Актуальная сборка проекта в современном матовом оформлении. Выберите нужное действие ниже.</p>
         </header>
 
-        <section class="features">
-            <div class="card">
-                <div class="card-icon">⚡</div>
-                <h3>Автоловля заказов</h3>
-                <p>Перехватывает заказы через диалоги и чат с естественными задержками клика без риска для аккаунта.</p>
-            </div>
-            <div class="card">
-                <div class="card-icon">💰</div>
-                <h3>Счётчик зарплаты</h3>
-                <p>Раздельный учет для Такси, Дальнобойщиков и Инкассаторов с валидацией через пройденную дистанцию.</p>
-            </div>
-            <div class="card">
-                <div class="card-icon">🛡️</div>
-                <h3>Защита баланса</h3>
-                <p>Полная блокировка случайных оплат — скрипт игнорирует любые всплывающие окна с комиссиями и :CASH:.</p>
-            </div>
-            <div class="card">
-                <div class="card-icon">🔄</div>
-                <h3>OTA Обновления</h3>
-                <p>Проверка релизов напрямую с GitHub и обновление скрипта прямо во время игры в один тап.</p>
-            </div>
-        </section>
-
-        <section class="download-box">
-            <h2>Начни работать эффективнее</h2>
-            <p>Для работы требуется MoonLoader или MonetLoader.</p>
-            
-            <div class="action-row">
-                <a href="https://github.com/hshajqk710-glitch/Help-for-Job/releases" class="btn btn-primary">Скачать HfJ</a>
-                
-                <a href="https://github.com/hshajqk710-glitch/Help-for-Job" class="btn btn-secondary">
-                    <svg viewBox="0 0 24 24" aria-hidden="true">
-                        <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"></path>
-                    </svg>
-                    Исходный код (GitHub)
-                </a>
+        <section class="dashboard" aria-label="Панель загрузки Help for Job">
+            <div class="dash-header">
+                <div class="brand">
+                    <div class="brand-emblem">HfJ</div>
+                    <div class="brand-text">
+                        <strong>HELP FOR JOB</strong>
+                        <span id="header-ver">v29.3.1</span>
+                    </div>
+                </div>
+                <div class="dash-title">Центр загрузки</div>
+                <div class="status-chip">
+                    <span class="dot"></span>
+                    <span>Доступно</span>
+                </div>
             </div>
 
-            <div>
-                <a href="https://docs.google.com/forms/d/e/1FAIpQLSforWXak0MWrzJzng8awgZL75heZqCeklF5abC10rlPJ7X1kg/viewform?usp=dialog" target="_blank" class="bug-link">
-                    🐛 Нашли баг? Напишите нам
+            <div class="dash-body">
+                <div class="meta-grid">
+                    <div class="meta-card">
+                        <span class="meta-label">Версия</span>
+                        <span class="meta-value mono" id="card-ver">v29.3.1</span>
+                    </div>
+                    <div class="meta-card">
+                        <span class="meta-label">Среда запуска</span>
+                        <span class="meta-value">MonetLoader / MoonLoader</span>
+                    </div>
+                    <div class="meta-card">
+                        <span class="meta-label">Дизайн</span>
+                        <span class="meta-value">Automotive Matte</span>
+                    </div>
+                </div>
+
+                <a class="download-bar" href="https://github.com/hshajqk710-glitch/Help-for-Job/releases" target="_blank" rel="noopener noreferrer">
+                    <div class="download-left">
+                        <div class="download-icon-circle" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                <polyline points="7 10 12 15 17 10"/>
+                                <line x1="12" y1="15" x2="12" y2="3"/>
+                            </svg>
+                        </div>
+                        <div class="download-copy">
+                            <strong>Скачать HfJ</strong>
+                            <span id="dl-sub">Актуальный релиз · Один .lua файл</span>
+                        </div>
+                    </div>
+                    <div class="download-cta">
+                        <span>Перейти к загрузке</span>
+                        <span aria-hidden="true">→</span>
+                    </div>
                 </a>
+
+                <div class="secondary-row">
+                    <a class="action-tile" href="https://github.com/hshajqk710-glitch/Help-for-Job" target="_blank" rel="noopener noreferrer">
+                        <div class="action-tile-left">
+                            <div class="action-icon" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <polyline points="16 18 22 12 16 6"/>
+                                    <polyline points="8 6 2 12 8 18"/>
+                                </svg>
+                            </div>
+                            <div class="action-text">
+                                <strong>Исходный код</strong>
+                                <span>Открыть репозиторий проекта</span>
+                            </div>
+                        </div>
+                        <span class="arrow" aria-hidden="true">→</span>
+                    </a>
+
+                    <a class="action-tile bug" href="https://docs.google.com/forms/d/e/1FAIpQLSforWXak0MWrzJzng8awgZL75heZqCeklF5abC10rlPJ7X1kg/viewform?usp=dialog" target="_blank" rel="noopener noreferrer">
+                        <div class="action-tile-left">
+                            <div class="action-icon" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="12" cy="12" r="10"/>
+                                    <line x1="12" y1="8" x2="12" y2="12"/>
+                                    <line x1="12" y1="16" x2="12.01" y2="16"/>
+                                </svg>
+                            </div>
+                            <div class="action-text">
+                                <strong>Нашли ошибку?</strong>
+                                <span>Отправить короткий отчёт</span>
+                            </div>
+                        </div>
+                        <span class="arrow" aria-hidden="true">→</span>
+                    </a>
+                </div>
             </div>
+
+            <footer class="dash-footer">
+                <div class="dash-footer-note">
+                    <span class="accent-bar" aria-hidden="true"></span>
+                    <span>Help for Job (HfJ)</span>
+                </div>
+                <span>Требуется MoonLoader или MonetLoader</span>
+            </footer>
         </section>
-    </div>
+    </main>
+
+    <script>
+        (function () {
+            fetch('https://raw.githubusercontent.com/hshajqk710-glitch/Help-for-Job/main/version.txt', { cache: 'no-store' })
+                .then(function (r) { return r.ok ? r.text() : Promise.reject(); })
+                .then(function (txt) {
+                    var m = (txt || '').trim().match(/^v?(\d+\.\d+\.\d+)$/);
+                    if (!m) return;
+                    var v = 'v' + m[1];
+                    var hv = document.getElementById('header-ver');
+                    var cv = document.getElementById('card-ver');
+                    var ds = document.getElementById('dl-sub');
+                    if (hv) hv.textContent = v;
+                    if (cv) cv.textContent = v;
+                    if (ds) ds.textContent = 'Актуальный релиз ' + v + ' · Один .lua файл';
+                })
+                .catch(function () {});
+        })();
+    </script>
 </body>
 </html>
