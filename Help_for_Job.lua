@@ -1,10 +1,10 @@
 -- Help_for_Job.lua
 -- MonetLoader 3.8.x / MoonLoader
 -- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам + автообновление
--- v29.3.1 (HfJ Automotive Dashboard)
+-- v30.0.0 (HfJ Automotive Dashboard)
 
 script_name('HfJ')
-script_version('29.3.1')
+script_version('30.0.0')
 
 local imgui    = require 'mimgui'
 local new      = imgui.new
@@ -13,7 +13,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local sampev = require 'samp.events'
 
-local VERSION       = '29.3.1'
+local VERSION       = '30.0.0'
 local LOCAL_VERSION = VERSION
 
 -- ============================================================
@@ -83,11 +83,13 @@ local FONT_LOGO    = nil
 local FONT_SUB     = nil
 local FONT_BIG     = nil
 local FONT_HERO    = nil
-local window       = new.bool(false)
+local window           = new.bool(false)
+local updateModal      = new.bool(false)
 
 local winPosInit = false
 
-local windowAlpha     = 0
+local windowAlpha      = 0
+local updateModalAlpha = 0
 local tabFade         = 1
 local tabSlide        = 0
 local activeTab       = 1
@@ -452,8 +454,7 @@ local UPDATE_URL_VERSION = ('https://raw.githubusercontent.com/%s/%s/%s/version.
 local UPDATE_URL_SCRIPT = ('https://raw.githubusercontent.com/%s/%s/%s/%s')
     :format(GH_USER, GH_REPO, GH_BRANCH, SCRIPT_FILENAME)
 
-local UPDATE_DIALOG_ID   = 8889
-local AUTO_CHECK_DELAY   = 12          -- сек после загрузки скрипта
+local AUTO_CHECK_DELAY   = 6           -- сек после загрузки скрипта
 local AUTO_CHECK_EVERY   = 30 * 60     -- сек между тихими проверками
 local DOWNLOAD_TIMEOUT   = 25          -- сек на одну попытку загрузки
 local MIN_SCRIPT_SIZE    = 20000       -- байт: защита от HTML/обрезки
@@ -463,9 +464,8 @@ local updateDownloading   = false
 local remoteVersion       = ''
 local updaterStatus       = L'не проверялось'
 local lastAutoCheck       = 0
-local pendingUpdatePrompt = false
-local promptRetryAt       = 0
 local promptedVersion     = nil
+local updProg             = { pct = 0, disp = 0, bytes = 0, total = 0, stage = '', startedAt = 0 }
 
 local okMoon, moonlib = pcall(require, 'moonloader')
 local DS_END = 6
@@ -531,10 +531,17 @@ local function writeFile(path, content)
     return true
 end
 
-local function socketRequestOnce(url)
+local function socketRequestOnce(url, onProgress)
     local body = {}
+    local received = 0
     local sink = function(chunk)
-        if chunk then body[#body + 1] = chunk end
+        if chunk then
+            body[#body + 1] = chunk
+            received = received + #chunk
+            if type(onProgress) == 'function' then
+                onProgress(5, received, 0)
+            end
+        end
         return 1
     end
 
@@ -558,10 +565,10 @@ local function socketRequestOnce(url)
     return nil, code, nil, location
 end
 
-local function socketFetch(url)
+local function socketFetch(url, onProgress)
     local current = urlNoCache(url)
     for attempt = 1, 4 do
-        local text, code, err, location = socketRequestOnce(current)
+        local text, code, err, location = socketRequestOnce(current, onProgress)
         if text then
             if text == '' then return nil, 'пустой ответ' end
             return text
@@ -579,50 +586,70 @@ local function socketFetch(url)
     return nil, 'слишком много редиректов'
 end
 
-local function rawFetch(url, timeout)
+local function rawFetch(url, timeout, onProgress)
     local tmp = WORK_DIR .. '/hfj_upd_tmp.txt'
     os.remove(tmp)
     local finished = false
-    local ok = pcall(downloadUrlToFile, urlNoCache(url), tmp, function(id, status)
+    local gotCbBytes = false
+    local ok = pcall(downloadUrlToFile, urlNoCache(url), tmp, function(id, status, p1, p2)
+        local n1, n2 = tonumber(p1) or 0, tonumber(p2) or 0
+        if n1 > 0 then gotCbBytes = true end
+        if type(onProgress) == 'function' then
+            onProgress(status, n1, n2)
+        end
         if status == DS_END then finished = true end
     end)
     if not ok then return nil, 'downloadUrlToFile недоступен' end
     local t0 = os.time()
-    while not finished and (os.time() - t0) < (timeout or DOWNLOAD_TIMEOUT) do wait(0) end
+    local nextPoll = os.clock() + 0.10
+    while not finished and (os.time() - t0) < (timeout or DOWNLOAD_TIMEOUT) do
+        wait(0)
+        if type(onProgress) == 'function' and not gotCbBytes and os.clock() >= nextPoll then
+            nextPoll = os.clock() + 0.10
+            local f = io.open(tmp, 'rb')
+            if f then
+                local sz = f:seek('end') or 0
+                f:close()
+                if sz > 0 then onProgress(5, sz, 0) end
+            end
+        end
+    end
     local content = finished and readFile(tmp) or nil
     os.remove(tmp)
     if not content or content == '' then return nil, 'таймаут downloadUrlToFile' end
     return content
 end
 
-local function requestsFetch(url)
+local function requestsFetch(url, onProgress)
     if not hasRequests then return nil, 'нет requests' end
+    if type(onProgress) == 'function' then onProgress(2, 0, 0) end
     local ok, resp = pcall(requestsLib.request, 'GET', urlNoCache(url))
     if not ok or not resp then return nil, 'requests: ' .. tostring(resp) end
     local code = tonumber(resp.status_code) or 0
     if code ~= 200 then return nil, 'requests HTTP ' .. tostring(code) end
     local body = resp.text or resp.content
     if not body or body == '' then return nil, 'requests: пустой ответ' end
+    if type(onProgress) == 'function' then onProgress(DS_END, #body, #body) end
     return body
 end
 
-local function fetchText(url, timeout)
+local function fetchText(url, timeout, onProgress)
     local errors = {}
 
     if hasRawDownload then
-        local body, err = rawFetch(url, timeout)
+        local body, err = rawFetch(url, timeout, onProgress)
         if body then return body end
         errors[#errors + 1] = 'raw: ' .. tostring(err)
         logAct('Fetch fail (downloadUrlToFile): ' .. tostring(err))
     end
     if hasRequests then
-        local body, err = requestsFetch(url)
+        local body, err = requestsFetch(url, onProgress)
         if body then return body end
         errors[#errors + 1] = 'requests: ' .. tostring(err)
         logAct('Fetch fail (requests): ' .. tostring(err))
     end
     if hasSecureHttp or (okHttp and http) then
-        local body, err = socketFetch(url)
+        local body, err = socketFetch(url, onProgress)
         if body then return body end
         errors[#errors + 1] = 'socket: ' .. tostring(err)
         logAct('Fetch fail (socket): ' .. tostring(err))
@@ -654,12 +681,14 @@ end
 
 local doCheck, doUpdate
 
--- Ставим флаг, а сам диалог показываем из главного цикла (безопасно для mimgui/samp)
+-- Открываем фирменное стилизованное окно обновления
 local function promptUpdate()
     if not updateAvailable then return end
     if promptedVersion == remoteVersion then return end
     promptedVersion = remoteVersion
-    pendingUpdatePrompt = true
+    updateModal[0] = true
+    updateModalAlpha = 0
+    logAct('Update modal opened for v' .. remoteVersion)
 end
 
 doCheck = function(silent, thenDownload)
@@ -728,31 +757,73 @@ doUpdate = function()
 
     updateDownloading = true
     updaterStatus = L'скачиваю v' .. remoteVersion
+    updProg.pct       = 0.05
+    updProg.disp      = 0.02
+    updProg.bytes     = 0
+    updProg.total     = 0
+    updProg.stage     = L'Подключаемся к серверу...'
+    updProg.startedAt = os.clock()
+    if not updateModal[0] then
+        updateModal[0] = true
+        updateModalAlpha = 0
+    end
     notify(L'Скачиваю обновление v' .. remoteVersion .. '...', 0x00CCB3)
 
     lua_thread.create(function()
-        local ok, body, err = pcall(fetchText, UPDATE_URL_SCRIPT, DOWNLOAD_TIMEOUT)
-        updateDownloading = false
+        local function onDlProgress(status, p1, p2)
+            if status == DS_END then
+                updProg.pct = math.max(updProg.pct, 0.88)
+                updProg.stage = L'Файл скачан, проверяем...'
+            elseif p2 > 0 and p1 > 0 then
+                updProg.bytes = p1
+                updProg.total = p2
+                updProg.pct = math.max(updProg.pct, math.min(0.88, (p1 / p2) * 0.88))
+                updProg.stage = L'Загрузка файла обновления...'
+            elseif p1 > 0 then
+                updProg.bytes = p1
+                updProg.pct = math.max(updProg.pct, math.min(0.84, (p1 / 145000) * 0.84))
+                updProg.stage = L'Загрузка файла обновления...'
+            else
+                updProg.pct = math.max(updProg.pct, 0.14)
+            end
+        end
+
+        local ok, body, err = pcall(fetchText, UPDATE_URL_SCRIPT, DOWNLOAD_TIMEOUT, onDlProgress)
         if not ok then body, err = nil, tostring(body) end
 
         if not body or body == '' then
+            updateDownloading = false
+            updProg.pct = 0; updProg.disp = 0
             updaterStatus = L'ошибка загрузки'
+            updProg.stage = updaterStatus
             logErr('Update download failed: ' .. tostring(err))
             notify(L'Ошибка скачивания обновления', 0xFF0000)
             return
         end
 
+        updProg.bytes = #body
+        updProg.total = #body
+        updProg.pct   = 0.91
+        updProg.stage = L'Проверяем целостность файла...'
+        wait(120)
+
         if #body < MIN_SCRIPT_SIZE then
+            updateDownloading = false
+            updProg.pct = 0; updProg.disp = 0
             updaterStatus = L'файл повреждён'
+            updProg.stage = updaterStatus
             logAct('Download rejected: too small (' .. #body .. ' b)')
             notify(L'Скачался битый файл (' .. #body .. L' байт)', 0xFF0000)
             return
         end
 
         if not body:find('script_name', 1, true) then
+            updateDownloading = false
+            updProg.pct = 0; updProg.disp = 0
             updaterStatus = L'это не скрипт'
+            updProg.stage = updaterStatus
             logAct('Download rejected: no script_name')
-            notify(L'На GitHub лежит не скрипт', 0xFF0000)
+            notify(L'На сервере лежит не скрипт', 0xFF0000)
             return
         end
 
@@ -761,9 +832,16 @@ doUpdate = function()
             logAct('Warning: version.txt = ' .. remoteVersion .. ', file = ' .. dlVer)
         end
 
+        updProg.pct   = 0.95
+        updProg.stage = L'Устанавливаем обновление...'
+        wait(120)
+
         local tmp = WORK_DIR .. '/hfj_update.lua'
         if not writeFile(tmp, body) then
+            updateDownloading = false
+            updProg.pct = 0; updProg.disp = 0
             updaterStatus = L'ошибка записи'
+            updProg.stage = updaterStatus
             notify(L'Не удалось записать обновление', 0xFF0000)
             return
         end
@@ -792,6 +870,8 @@ doUpdate = function()
 
         -- 3) совсем не вышло - кладём рядом и просим заменить вручную
         if not installed then
+            updateDownloading = false
+            updProg.pct = 0; updProg.disp = 0
             local alt = dest:gsub('%.lua$', '') .. '_new.lua'
             if writeFile(alt, body) then
                 updaterStatus = L'нужна ручная замена'
@@ -805,12 +885,18 @@ doUpdate = function()
             return
         end
 
+        updProg.pct   = 1.0
+        updProg.stage = L'Готово! Перезапускаем скрипт :D'
         updateAvailable   = false
         promptedVersion   = nil
         updaterStatus     = L'установлено v' .. (dlVer or remoteVersion)
         logAct('Update installed: v' .. tostring(dlVer or remoteVersion) .. ' -> ' .. tostring(dest))
         notify(L'Обновление установлено - перезапуск...', 0x00FF00)
-        wait(1200)
+        wait(950)
+
+        updateDownloading = false
+        updateModal[0]    = false
+        wait(200)
 
         local okInfo, info = pcall(thisScript)
         if okInfo and info then
@@ -1180,7 +1266,6 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
         tostring(id), tostring(title), tostring(b1), tostring(b2)))
 
     if tonumber(id) == ZP_DIALOG_ID then return end
-    if tonumber(id) == UPDATE_DIALOG_ID then return end
 
     local titleN = normalize(stripColors(title or ''))
     local bodyN  = normalize(stripColors(text or ''))
@@ -2035,22 +2120,32 @@ local function SettingsTabFrame()
         local cardH = SC(156)
         local p = imgui.GetCursorScreenPos()
         local DL = imgui.GetWindowDrawList()
+        local updPulse = updateAvailable and (0.55 + 0.45 * math.sin(os.clock() * 3.5)) or 0.35
 
-        -- Выделенная карточка с бирюзовой рамкой и верхним акцентом
-        DrawNeuBox(DL, p.x, p.y, p.x + w, p.y + cardH, SC(16), THEME.card, a,
-            imgui.ImVec4(THEME.accent.x, THEME.accent.y, THEME.accent.z, updateAvailable and 0.65 or 0.35))
+        -- Выделенная карточка с бирюзовой / изумрудной рамкой (пульсирует если доступно обновление)
+        local cardBg = updateAvailable
+            and LerpVec4(THEME.card, imgui.ImVec4(0.08, 0.21, 0.19, 1.0), 0.35 + 0.25 * updPulse)
+            or  THEME.card
+        local borderCol = updateAvailable
+            and LerpVec4(THEME.accent, THEME.emerald, updPulse)
+            or  THEME.accent
+        DrawNeuBox(DL, p.x, p.y, p.x + w, p.y + cardH, SC(16), cardBg, a,
+            imgui.ImVec4(borderCol.x, borderCol.y, borderCol.z, updateAvailable and (0.55 + 0.35 * updPulse) or 0.35))
         DL:AddRectFilled(
             imgui.ImVec2(p.x + SC(18), p.y + SC(1)),
             imgui.ImVec2(p.x + w - SC(18), p.y + SC(4)),
-            C(imgui.ImVec4(THEME.accent.x, THEME.accent.y, THEME.accent.z, 0.80 * a)), SC(2))
+            C(imgui.ImVec4(borderCol.x, borderCol.y, borderCol.z, (updateAvailable and 0.95 or 0.75) * a)), SC(2))
 
         -- Заголовок скрипта слева
         if FONT_BIG then imgui.PushFont(FONT_BIG) end
         DL:AddText(imgui.ImVec2(p.x + SC(20), p.y + SC(18)), CA(THEME.text, a), 'Help for Job (HfJ)')
         if FONT_BIG then imgui.PopFont() end
 
-        -- Выделенный бейдж текущей скачанной версии справа вверху
-        local verBadge = u8(L'Версия: v') .. LOCAL_VERSION
+        -- Выделенный бейдж справа вверху (при наличии обновления подсвечивается новая версия)
+        local verBadge = updateAvailable
+            and (u8(L'Доступно: v') .. u8(remoteVersion))
+            or  (u8(L'Версия: v') .. LOCAL_VERSION)
+        local badgeAccent = updateAvailable and THEME.emerald or THEME.accentBright
         if FONT_BIG then imgui.PushFont(FONT_BIG) end
         local vbs = imgui.CalcTextSize(verBadge)
         local vbW = vbs.x + SC(24)
@@ -2058,16 +2153,18 @@ local function SettingsTabFrame()
         local vbX = p.x + w - vbW - SC(18)
         local vbY = p.y + SC(14)
         DL:AddRectFilled(imgui.ImVec2(vbX, vbY), imgui.ImVec2(vbX + vbW, vbY + vbH),
-            C(imgui.ImVec4(THEME.accent.x, THEME.accent.y, THEME.accent.z, 0.16 * a)), SC(10))
+            C(imgui.ImVec4(badgeAccent.x, badgeAccent.y, badgeAccent.z, (updateAvailable and 0.24 or 0.16) * a)), SC(10))
         DL:AddRect(imgui.ImVec2(vbX, vbY), imgui.ImVec2(vbX + vbW, vbY + vbH),
-            C(imgui.ImVec4(THEME.accentBright.x, THEME.accentBright.y, THEME.accentBright.z, 0.65 * a)), SC(10), 0, SC(1.2))
+            C(imgui.ImVec4(badgeAccent.x, badgeAccent.y, badgeAccent.z, (updateAvailable and 0.85 or 0.65) * a)), SC(10), 0, SC(1.2))
         DL:AddText(imgui.ImVec2(vbX + (vbW - vbs.x) / 2, vbY + (vbH - vbs.y) / 2),
-            CA(THEME.accentBright, a), verBadge)
+            CA(badgeAccent, a), verBadge)
         if FONT_BIG then imgui.PopFont() end
 
         -- Крупная строка статуса обновления (шрифт по умолчанию 19px)
-        local statusTxt = u8(L'Статус обновлений: ') .. u8(updaterStatus)
-        local statusCol = updateAvailable and THEME.accentBright or THEME.dim
+        local statusTxt = updateAvailable
+            and (u8(L'Установлена v') .. LOCAL_VERSION .. u8(L'  •  Требуется обновление!'))
+            or  (u8(L'Статус обновлений: ') .. u8(updaterStatus))
+        local statusCol = updateAvailable and THEME.emerald or THEME.dim
         DL:AddText(imgui.ImVec2(p.x + SC(20), p.y + SC(54)), CA(statusCol, a), statusTxt)
 
         -- Главная кнопка проверки / установки обновления
@@ -2084,17 +2181,17 @@ local function SettingsTabFrame()
         end
 
         local btnCol = updateAvailable
-            and (hovered and THEME.accentBright or THEME.accent)
+            and (hovered and THEME.emerald or LerpVec4(THEME.accent, THEME.emerald, 0.45))
             or  (hovered and THEME.tileHover or THEME.tile)
-        local txtCol = updateAvailable and imgui.ImVec4(0.05, 0.08, 0.09, 1.0) or THEME.text
+        local txtCol = updateAvailable and imgui.ImVec4(0.04, 0.08, 0.07, 1.0) or THEME.text
         DrawNeuBox(DL, bp.x, bp.y, bp.x + btnW, bp.y + btnH, SC(12), btnCol, a,
-            updateAvailable and THEME.accentBright or imgui.ImVec4(THEME.accent.x, THEME.accent.y, THEME.accent.z, 0.28))
+            updateAvailable and THEME.emerald or imgui.ImVec4(THEME.accent.x, THEME.accent.y, THEME.accent.z, 0.28))
 
         local updText
         if updateDownloading then
             updText = u8(L'Проверка / загрузка...')
         elseif updateAvailable then
-            updText = u8(L'Установить обновление v') .. u8(remoteVersion)
+            updText = u8(L'Обновить сейчас до v') .. u8(remoteVersion)
         else
             updText = u8(L'Проверить обновления')
         end
@@ -2124,7 +2221,6 @@ local function SettingsTabFrame()
             { '/update',    L'скачать обновление' },
             { '/updinfo',   L'диагностика апдейтера' },
             { '/takecargo', L'взять заказ (клавиша 2)' },
-            { '/taxord',    L'совместимый алиас меню' },
         }
         local rowH   = SC(32)
         local infoH  = SC(72)
@@ -2395,6 +2491,16 @@ local function DashboardWindow(var)
             DrawVectorIcon(DL, tab.icon, icx, icy, SC(20) * iconScale,
                 imgui.ImVec4(col.x, col.y, col.z, a))
 
+            -- Точка-бейдж на вкладке «Настройки», если доступно обновление
+            if tab.id == 3 and updateAvailable then
+                local bpulse = 0.55 + 0.45 * math.sin(os.clock() * 4.5)
+                local dx, dy = icx + SC(14), icy - SC(9)
+                DL:AddCircleFilled(imgui.ImVec2(dx, dy), SC(6.5),
+                    C(imgui.ImVec4(THEME.emerald.x, THEME.emerald.y, THEME.emerald.z, 0.25 * bpulse * a)), 14)
+                DL:AddCircleFilled(imgui.ImVec2(dx, dy), SC(4),
+                    CA(THEME.emerald, a), 14)
+            end
+
             if FONT_SUB then imgui.PushFont(FONT_SUB) end
             local nts = imgui.CalcTextSize(tab.name)
             DL:AddText(imgui.ImVec2(ix + (itemW - nts.x) / 2, iy + ih - nts.y - SC(5)),
@@ -2542,6 +2648,265 @@ imgui.OnFrame(
         end
 
         DashboardWindow(window)
+    end
+)
+
+-- ============================================================
+--  ОКНО АВТООБНОВЛЕНИЯ (СТИЛЬ HFJ AUTOMOTIVE DASHBOARD)
+-- ============================================================
+imgui.OnFrame(
+    function() return (updateModal[0] or updateModalAlpha > 0.005) and isSampAvailable() and not isPauseMenuActive() end,
+    function(this)
+        this.ShowCursor = (updateModal[0] or updateModalAlpha > 0.35)
+        local target = updateModal[0] and 1.0 or 0.0
+        updateModalAlpha = updateModalAlpha + (target - updateModalAlpha) * 0.28
+        if math.abs(target - updateModalAlpha) < 0.01 then updateModalAlpha = target end
+
+        if updateModalAlpha <= 0.005 and not updateModal[0] then
+            updateModalAlpha = 0
+            return
+        end
+
+        local sw, sh = getScreenResolution()
+        if not sw or sw <= 0 then sw, sh = 1280, 720 end
+
+        local mw = math.min(SC(460), sw - SC(32))
+        local mh = SC(292)
+        local a  = updateModalAlpha
+
+        imgui.SetNextWindowPos(imgui.ImVec2(sw / 2, sh / 2), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
+        imgui.SetNextWindowSize(imgui.ImVec2(mw, mh), imgui.Cond.Always)
+        imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, math.max(0.01, a))
+
+        local visible = imgui.Begin('##HfJUpdateModal', nil,
+            imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoBackground
+            + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoResize
+            + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoCollapse)
+
+        if visible then
+            local pos = imgui.GetWindowPos()
+            local DL  = imgui.GetWindowDrawList()
+            local R   = SC(18)
+
+            -- Матовый графитовый фон с мягкой тенью и бирюзовой рамкой
+            DL:AddRectFilled(
+                imgui.ImVec2(pos.x + SC(5), pos.y + SC(7)),
+                imgui.ImVec2(pos.x + mw + SC(7), pos.y + mh + SC(10)),
+                CA(THEME.shadowDark, 0.85 * a), R + SC(4))
+            DL:AddRectFilled(pos, imgui.ImVec2(pos.x + mw, pos.y + mh), CA(THEME.bg, a), R)
+            DL:AddRect(pos, imgui.ImVec2(pos.x + mw, pos.y + mh),
+                C(imgui.ImVec4(THEME.accent.x, THEME.accent.y, THEME.accent.z, 0.55 * a)), R, 0, SC(1.5))
+
+            -- Верхняя акцентная полоска
+            DL:AddRectFilled(
+                imgui.ImVec2(pos.x + SC(20), pos.y + SC(1)),
+                imgui.ImVec2(pos.x + mw - SC(20), pos.y + SC(4)),
+                CA(THEME.emerald, a), SC(2))
+
+            -- Шапка окна обновления: эмблема HfJ + заголовок
+            local bx, by = pos.x + SC(20), pos.y + SC(18)
+            DL:AddRectFilled(imgui.ImVec2(bx, by), imgui.ImVec2(bx + SC(42), by + SC(36)),
+                CA(THEME.accentDark, a), SC(10))
+            DL:AddRectFilled(imgui.ImVec2(bx, by), imgui.ImVec2(bx + SC(42), by + SC(22)),
+                CA(THEME.emerald, 0.85 * a), SC(10), 3)
+            if FONT_BIG then imgui.PushFont(FONT_BIG) end
+            local ms = imgui.CalcTextSize('HfJ')
+            DL:AddText(imgui.ImVec2(bx + (SC(42) - ms.x) / 2, by + (SC(36) - ms.y) / 2),
+                C(imgui.ImVec4(0.04, 0.08, 0.07, a)), 'HfJ')
+            local modalTitle = updateDownloading
+                and u8(L'Обновление скрипта')
+                or  u8(L'Доступно обновление')
+            DL:AddText(imgui.ImVec2(bx + SC(54), by + SC(6)), CA(THEME.text, a), modalTitle)
+            if FONT_BIG then imgui.PopFont() end
+
+            -- Внутренняя карточка: либо предложение обновиться, либо живой прогресс загрузки 0-100%
+            local cx1, cy1 = pos.x + SC(20), pos.y + SC(68)
+            local cx2, cy2 = pos.x + mw - SC(20), pos.y + SC(210)
+            DrawNeuBox(DL, cx1, cy1, cx2, cy2, SC(14), THEME.card, a)
+
+            -- Верхняя строка карточки: сравнение версий
+            local verCur = u8(L'Установлена: v') .. LOCAL_VERSION
+            local verNew = u8(L'Новая: v') .. u8(remoteVersion ~= '' and remoteVersion or '?')
+            DL:AddText(imgui.ImVec2(cx1 + SC(16), cy1 + SC(15)), CA(THEME.dim, a), verCur)
+            if FONT_BIG then imgui.PushFont(FONT_BIG) end
+            local vns = imgui.CalcTextSize(verNew)
+            DL:AddText(imgui.ImVec2(cx2 - vns.x - SC(16), cy1 + SC(13)), CA(THEME.emerald, a), verNew)
+            if FONT_BIG then imgui.PopFont() end
+
+            DL:AddLine(
+                imgui.ImVec2(cx1 + SC(16), cy1 + SC(46)),
+                imgui.ImVec2(cx2 - SC(16), cy1 + SC(46)),
+                C(imgui.ImVec4(1, 1, 1, 0.06 * a)), SC(1))
+
+            if updateDownloading then
+                -- Плавная анимация процента к реальному значению
+                updProg.disp = updProg.disp + (updProg.pct - updProg.disp) * 0.22
+                if math.abs(updProg.pct - updProg.disp) < 0.004 then updProg.disp = updProg.pct end
+                local pctVal = math.max(0, math.min(100, math.floor(updProg.disp * 100 + 0.5)))
+
+                -- Весёлые, безопасные для Android шрифтов фразы со смайликами по этапам
+                local funCaption
+                local tick = math.floor((os.clock() - updProg.startedAt) / 1.0)
+                if pctVal >= 100 then
+                    funCaption = L'Готово! Перезапускаем скрипт :D'
+                elseif pctVal >= 88 then
+                    local pool = {
+                        L'Ставим свежую обнову ;)',
+                        L'Переписываем скрипт... =)',
+                        L'Почти на финише! ^_^',
+                        L'Финальная полировка! :D',
+                    }
+                    funCaption = pool[(tick % #pool) + 1]
+                elseif pctVal >= 48 then
+                    local pool = {
+                        L'Меняем версию на новую :D',
+                        L'Прокачиваем тачку HfJ! ;)',
+                        L'Подкручиваем гайки... =)',
+                        L'Тюнингуем автоловлю ^_^',
+                    }
+                    funCaption = pool[(tick % #pool) + 1]
+                elseif pctVal >= 16 then
+                    local pool = {
+                        L'Качаем новый код... ^_^',
+                        L'Забираем свежую версию ;)',
+                        L'Заливаем новые фишки :D',
+                        L'Чистим старые файлы...',
+                    }
+                    funCaption = pool[(tick % #pool) + 1]
+                else
+                    local pool = {
+                        L'Стучимся на сервер... ;)',
+                        L'Ищем свежий релиз... ^_^',
+                        L'Разогреваем движок... =)',
+                    }
+                    funCaption = pool[(tick % #pool) + 1]
+                end
+
+                -- Спиннер + фраза слева, крупный процент справа
+                DrawVectorIcon(DL, 'spinner', cx1 + SC(26), cy1 + SC(69), SC(18),
+                    imgui.ImVec4(THEME.emerald.x, THEME.emerald.y, THEME.emerald.z, a))
+                DL:AddText(imgui.ImVec2(cx1 + SC(44), cy1 + SC(59)), CA(THEME.text, a), u8(funCaption))
+
+                local pctTxt = tostring(pctVal) .. '%'
+                if FONT_BIG then imgui.PushFont(FONT_BIG) end
+                local pts = imgui.CalcTextSize(pctTxt)
+                DL:AddText(imgui.ImVec2(cx2 - pts.x - SC(16), cy1 + SC(56)), CA(THEME.emerald, a), pctTxt)
+                if FONT_BIG then imgui.PopFont() end
+
+                -- Прогресс-бар от 0 до 100%
+                local barX1 = cx1 + SC(16)
+                local barX2 = cx2 - SC(16)
+                local barY1 = cy1 + SC(90)
+                local barY2 = cy1 + SC(104)
+                local barR  = SC(7)
+                local trackW = barX2 - barX1
+                local fillW  = trackW * math.max(0.03, math.min(1, updProg.disp))
+
+                DL:AddRectFilled(imgui.ImVec2(barX1, barY1), imgui.ImVec2(barX2, barY2),
+                    CA(THEME.cardDark, a), barR)
+                DL:AddRect(imgui.ImVec2(barX1, barY1), imgui.ImVec2(barX2, barY2),
+                    C(imgui.ImVec4(1, 1, 1, 0.08 * a)), barR, 0, SC(1))
+
+                local wave = 0.5 + 0.5 * math.sin(os.clock() * 4.5)
+                local fillCol = LerpVec4(THEME.accent, THEME.emerald, 0.45 + 0.45 * wave)
+                DL:AddRectFilled(imgui.ImVec2(barX1, barY1), imgui.ImVec2(barX1 + fillW, barY2),
+                    CA(fillCol, a), barR)
+                -- Бегущий светлый блик внутри заполненной полоски
+                if fillW > SC(28) and pctVal < 100 then
+                    local shineW = math.min(SC(38), fillW * 0.4)
+                    local shineX = barX1 + (fillW - shineW) * ((os.clock() * 1.1) % 1.0)
+                    DL:AddRectFilled(
+                        imgui.ImVec2(shineX, barY1 + SC(2)),
+                        imgui.ImVec2(shineX + shineW, barY2 - SC(2)),
+                        C(imgui.ImVec4(0.85, 1.0, 0.95, 0.35 * a)), SC(5))
+                end
+
+                -- Подпись под прогресс-баром: реальные КБ + бодрый хинт
+                if FONT_SUB then imgui.PushFont(FONT_SUB) end
+                local kbTxt
+                if updProg.total > 0 then
+                    kbTxt = string.format('%.1f / %.1f %s', updProg.bytes / 1024, updProg.total / 1024, u8(L'КБ'))
+                elseif updProg.bytes > 0 then
+                    kbTxt = string.format('%.1f %s', updProg.bytes / 1024, u8(L'КБ загружено'))
+                else
+                    kbTxt = u8(updProg.stage)
+                end
+                DL:AddText(imgui.ImVec2(barX1, cy1 + SC(114)), CA(THEME.dim, a), kbTxt)
+
+                local subPool = {
+                    L'Не сворачивайте игру ^_^',
+                    L'Статистика сохранится ;)',
+                    L'Автоловля уже на старте :D',
+                    L'Скоро полетим по заказам =)',
+                    L'Ничего не пропадёт :P',
+                    L'Настраиваем всё за вас ;)',
+                }
+                local rightHint = u8(subPool[(tick % #subPool) + 1])
+                local rhs = imgui.CalcTextSize(rightHint)
+                DL:AddText(imgui.ImVec2(barX2 - rhs.x, cy1 + SC(114)), CA(THEME.accentBright, 0.85 * a), rightHint)
+                if FONT_SUB then imgui.PopFont() end
+            else
+                DL:AddText(imgui.ImVec2(cx1 + SC(16), cy1 + SC(62)), CA(THEME.text, a),
+                    u8(L'Вышла новая версия Help for Job.'))
+                DL:AddText(imgui.ImVec2(cx1 + SC(16), cy1 + SC(90)), CA(THEME.dim, a),
+                    u8(L'Советуем обновить скрипт прямо сейчас!'))
+            end
+
+            -- Нижние кнопки: Обновить (главная) и Отложить (вторичная)
+            local gap = SC(12)
+            local btnW = (mw - SC(40) - gap) / 2
+            local btnH = SC(48)
+            local btnY = pos.y + mh - btnH - SC(18)
+
+            -- Кнопка 1: Обновить
+            imgui.SetCursorScreenPos(imgui.ImVec2(pos.x + SC(20), btnY))
+            imgui.InvisibleButton('##hfj_modal_upd_now', imgui.ImVec2(btnW, btnH))
+            local clkUpd = imgui.IsItemClicked()
+            local hovUpd = imgui.IsItemHovered()
+            if clkUpd and not updateDownloading then
+                doUpdate()
+            end
+            local updBg = updateDownloading
+                and THEME.tile
+                or  (hovUpd and THEME.emerald or LerpVec4(THEME.accent, THEME.emerald, 0.45))
+            DrawNeuBox(DL, pos.x + SC(20), btnY, pos.x + SC(20) + btnW, btnY + btnH, SC(12),
+                updBg, a, THEME.emerald)
+            local updLbl = updateDownloading
+                and (tostring(math.max(0, math.min(100, math.floor(updProg.disp * 100 + 0.5)))) .. '%')
+                or  u8(L'Обновить')
+            if FONT_BIG then imgui.PushFont(FONT_BIG) end
+            local uls = imgui.CalcTextSize(updLbl)
+            DL:AddText(
+                imgui.ImVec2(pos.x + SC(20) + (btnW - uls.x) / 2, btnY + (btnH - uls.y) / 2),
+                CA(updateDownloading and THEME.emerald or imgui.ImVec4(0.04, 0.08, 0.07, 1.0), a),
+                updLbl)
+            if FONT_BIG then imgui.PopFont() end
+
+            -- Кнопка 2: Отложить
+            local bx2 = pos.x + SC(20) + btnW + gap
+            imgui.SetCursorScreenPos(imgui.ImVec2(bx2, btnY))
+            imgui.InvisibleButton('##hfj_modal_upd_later', imgui.ImVec2(btnW, btnH))
+            local clkLater = imgui.IsItemClicked()
+            local hovLater = imgui.IsItemHovered()
+            if clkLater then
+                updateModal[0] = false
+                if not updateDownloading then
+                    notify(L'Обновление отложено. Доступно в Настройках', 0xFFAA00)
+                end
+            end
+            DrawNeuBox(DL, bx2, btnY, bx2 + btnW, btnY + btnH, SC(12),
+                hovLater and THEME.tileHover or THEME.tile, a,
+                imgui.ImVec4(1, 1, 1, 0.08))
+            local laterLbl = updateDownloading and u8(L'Свернуть') or u8(L'Отложить')
+            if FONT_BIG then imgui.PushFont(FONT_BIG) end
+            local lls = imgui.CalcTextSize(laterLbl)
+            DL:AddText(
+                imgui.ImVec2(bx2 + (btnW - lls.x) / 2, btnY + (btnH - lls.y) / 2),
+                CA(THEME.text, a), laterLbl)
+            if FONT_BIG then imgui.PopFont() end
+        end
+        imgui.End()
+        imgui.PopStyleVar()
     end
 )
 
@@ -2699,7 +3064,6 @@ function main()
     end
 
     sampRegisterChatCommand('hfj', toggleMenu)
-    sampRegisterChatCommand('taxord', toggleMenu)
 
     sampRegisterChatCommand('zarabotok', function()
         sampShowDialog(ZP_DIALOG_ID, L'Заработок на работах', zpReportText(), L'ОК', L'Закрыть', 0)
@@ -2725,11 +3089,14 @@ function main()
         end)
     end)
 
-    sampRegisterChatCommand('checkupd', function() doCheck(false) end)
+    sampRegisterChatCommand('checkupd', function()
+        if not window[0] then promptedVersion = nil end
+        doCheck(false)
+    end)
     sampRegisterChatCommand('update', function() doUpdate() end)
     sampRegisterChatCommand('updinfo', function()
         notify(L'Версия: v' .. LOCAL_VERSION ..
-            ' | GitHub: v' .. (remoteVersion ~= '' and remoteVersion or '?'), 0x00CCB3)
+            L' | Сервер: v' .. (remoteVersion ~= '' and remoteVersion or '?'), 0x00CCB3)
         notify(L'Транспорты: ' .. updaterTransportsText(), 0x00CCB3)
         notify(L'Статус: ' .. updaterStatus, 0x00CCB3)
     end)
@@ -2758,43 +3125,6 @@ function main()
     while true do
         wait(0)
         local now = os.clock()
-
-        -- ОБРАБОТКА НАЖАТИЙ В НАШЕМ ЛОКАЛЬНОМ ДИАЛОГЕ ОБНОВЛЕНИЯ
-        local result, button, list, input = sampHasDialogRespond(UPDATE_DIALOG_ID)
-        if result then
-            logAct('Update dialog: button=' .. tostring(button))
-            pendingUpdatePrompt = false
-            promptedVersion = remoteVersion
-
-            if button == 1 then
-                updateAvailable = true
-                doUpdate()
-            else
-                notify(L'Обновление отложено. Команда: /update', 0xFFAA00)
-            end
-        end
-
-        -- Диалог "Доступно обновление?" показываем из главного потока
-        if pendingUpdatePrompt and now >= promptRetryAt then
-            local busy = false
-            if type(sampIsDialogActive) == 'function' then
-                local okBusy, v = pcall(sampIsDialogActive)
-                busy = (okBusy and v) and true or false
-            end
-
-            if not busy then
-                sampShowDialog(UPDATE_DIALOG_ID,
-                    L'Обновление Help for Job',
-                    string.format(L'Доступна версия: %s\nУ вас установлена: %s\n\nОбновить скрипт сейчас?',
-                        remoteVersion, LOCAL_VERSION),
-                    L'Обновить', L'Позже', 0)
-
-                pendingUpdatePrompt = false
-                logAct('Update prompt shown for v' .. remoteVersion)
-            else
-                promptRetryAt = now + 3
-            end
-        end
 
         -- Тихая проверка обновлений раз в 30 минут
         if canDownload and not updateDownloading
