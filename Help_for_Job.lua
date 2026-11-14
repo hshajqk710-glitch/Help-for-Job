@@ -1,10 +1,10 @@
 -- Help_for_Job.lua
 -- MonetLoader 3.8.x / MoonLoader
 -- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам + автообновление
--- v30.0.0 (HfJ Automotive Dashboard)
+-- v30.0.1 (HfJ Automotive Dashboard)
 
 script_name('HfJ')
-script_version('30.0.0')
+script_version('30.0.1')
 
 local imgui    = require 'mimgui'
 local new      = imgui.new
@@ -13,7 +13,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local sampev = require 'samp.events'
 
-local VERSION       = '30.0.0'
+local VERSION       = '30.0.1'
 local LOCAL_VERSION = VERSION
 
 -- ============================================================
@@ -483,12 +483,24 @@ local hasSecureHttp  = (okHttps and https ~= nil)
 
 local canDownload = hasRawDownload or hasRequests or hasSecureHttp
 
+local BLOCK = {
+    URL_PRIMARY  = ('https://raw.githubusercontent.com/%s/%s/%s/blocked_versions.txt'):format(GH_USER, GH_REPO, GH_BRANCH),
+    URL_FALLBACK = ('https://raw.githubusercontent.com/%s/%s/%s/blocked_versions/blocked_versions.txt'):format(GH_USER, GH_REPO, GH_BRANCH),
+    REOPEN_DELAY = 60,     -- через сколько секунд вернуть закрытое окно блокировки
+    blocked      = false,
+    modal        = new.bool(false),
+    modalAlpha   = 0,
+    reopenAt     = 0,
+    checking     = false,
+    matchedVer   = '',
+}
+
 local function updaterTransportsText()
     local list = {}
-    if hasRawDownload then list[#list + 1] = 'downloadUrlToFile' end
     if hasRequests    then list[#list + 1] = 'requests' end
     if hasSecureHttp  then list[#list + 1] = 'ssl.https' end
     if okHttp and http then list[#list + 1] = 'socket.http' end
+    if hasRawDownload then list[#list + 1] = 'downloadUrlToFile' end
     if #list == 0 then return 'нет' end
     return table.concat(list, ', ')
 end
@@ -497,22 +509,30 @@ local function urlNoCache(url)
     return url .. (url:find('?', 1, true) and '&' or '?') .. 'nocache=' .. tostring(os.time())
 end
 
--- Сравнение версий по частям: "28.0.10" больше, чем "28.0.9"
-local function verParts(s)
-    local t = {}
-    for p in tostring(s or ''):gmatch('%d+') do t[#t + 1] = tonumber(p) end
-    return t
+-- Сравнение версий обоих форматов: "30.0.0" < "30.0.1" < "c1.7" < "c1.10"
+local function parseVer(s)
+    local clean = tostring(s or ''):gsub('%s+', ''):gsub('^[vV]', '')
+    local gen, maj, min, hot = clean:match('^([a-zA-Z]?)(%d+)%.(%d+)%.?(%d*)$')
+    if not maj then return nil end
+    local genNum = (gen and gen ~= '') and gen:lower():byte() or 0
+    return { genNum, tonumber(maj) or 0, tonumber(min) or 0, tonumber(hot) or 0 }
 end
 
 local function verLt(a, b)
-    local pa, pb = verParts(a), verParts(b)
-    if #pa == 0 or #pb == 0 then return false end
-    for i = 1, math.max(#pa, #pb) do
-        local x, y = pa[i] or 0, pb[i] or 0
-        if x < y then return true end
-        if x > y then return false end
+    local pa, pb = parseVer(a), parseVer(b)
+    if not pa or not pb then return false end
+    for i = 1, 4 do
+        if pa[i] < pb[i] then return true end
+        if pa[i] > pb[i] then return false end
     end
     return false
+end
+
+local function fmtVer(v)
+    v = tostring(v or '')
+    if v == '' then return '?' end
+    if v:match('^[a-zA-Z]') then return v end
+    return 'v' .. v
 end
 
 local function readFile(path)
@@ -636,12 +656,6 @@ end
 local function fetchText(url, timeout, onProgress)
     local errors = {}
 
-    if hasRawDownload then
-        local body, err = rawFetch(url, timeout, onProgress)
-        if body then return body end
-        errors[#errors + 1] = 'raw: ' .. tostring(err)
-        logAct('Fetch fail (downloadUrlToFile): ' .. tostring(err))
-    end
     if hasRequests then
         local body, err = requestsFetch(url, onProgress)
         if body then return body end
@@ -654,6 +668,12 @@ local function fetchText(url, timeout, onProgress)
         errors[#errors + 1] = 'socket: ' .. tostring(err)
         logAct('Fetch fail (socket): ' .. tostring(err))
     end
+    if hasRawDownload then
+        local body, err = rawFetch(url, timeout, onProgress)
+        if body then return body end
+        errors[#errors + 1] = 'raw: ' .. tostring(err)
+        logAct('Fetch fail (downloadUrlToFile): ' .. tostring(err))
+    end
 
     if #errors == 0 then return nil, 'нет транспорта' end
     return nil, table.concat(errors, ' | ')
@@ -663,11 +683,31 @@ local function applyVersionText(text)
     local raw = tostring(text or ''):gsub('^\239\187\191', '')
     if #raw > 200 then return 'err' end
     local cleaned = raw:gsub('%s+', '')
-    local ver = cleaned:match('^v?(%d+%.%d+%.%d+)$')
+    local ver = cleaned:match('^[vV]?([a-zA-Z]?%d+%.%d+%.?%d*)$')
     if not ver then return 'err' end
     remoteVersion = ver
     updateAvailable = verLt(LOCAL_VERSION, ver)
     return updateAvailable and 'new' or 'same'
+end
+
+local function normVerToken(s)
+    return tostring(s or ''):gsub('%s+', ''):gsub('^[vV]', ''):lower()
+end
+
+local function checkBlockedText(body)
+    local raw = tostring(body or ''):gsub('^\239\187\191', '')
+    if raw:lower():find('<html', 1, true) then return false, '' end
+    local localTok = normVerToken(LOCAL_VERSION)
+    for line in (raw .. '\n'):gmatch('([^\r\n]*)\r?\n') do
+        local cleanLine = line:gsub('#.*$', ''):gsub('%-%-.*$', '')
+        for part in (cleanLine .. ','):gmatch('([^,]*),') do
+            local tok = normVerToken(part)
+            if tok ~= '' and tok == localTok then
+                return true, part:gsub('^%s+', ''):gsub('%s+$', '')
+            end
+        end
+    end
+    return false, ''
 end
 
 local function scriptPath()
@@ -679,19 +719,68 @@ local function scriptPath()
     return nil
 end
 
-local doCheck, doUpdate
+local doCheck, doUpdate, checkBlockedVersions
 
 -- Открываем фирменное стилизованное окно обновления
 local function promptUpdate()
+    if BLOCK.blocked then return end
     if not updateAvailable then return end
     if promptedVersion == remoteVersion then return end
     promptedVersion = remoteVersion
     updateModal[0] = true
     updateModalAlpha = 0
-    logAct('Update modal opened for v' .. remoteVersion)
+    logAct('Update modal opened for ' .. fmtVer(remoteVersion))
+end
+
+checkBlockedVersions = function(silent)
+    if BLOCK.checking or not canDownload then return end
+    BLOCK.checking = true
+    lua_thread.create(function()
+        local ok, body, err = pcall(fetchText, BLOCK.URL_PRIMARY, 12)
+        if not ok or not body or body:lower():find('<html', 1, true) then
+            local ok2, body2, err2 = pcall(fetchText, BLOCK.URL_FALLBACK, 12)
+            if ok2 and body2 and not body2:lower():find('<html', 1, true) then
+                body, err = body2, err2
+            elseif not ok then
+                body, err = nil, tostring(body)
+            end
+        end
+        BLOCK.checking = false
+
+        if not body then
+            logAct('Blocked-versions check skipped: ' .. tostring(err))
+            return
+        end
+
+        local isBlk, mVer = checkBlockedText(body)
+        if isBlk then
+            local wasBlocked = BLOCK.blocked
+            BLOCK.blocked    = true
+            BLOCK.matchedVer = mVer
+            window[0]        = false
+            updateModal[0]   = false
+            if not BLOCK.modal[0] then
+                BLOCK.modal[0]   = true
+                BLOCK.modalAlpha = 0
+            end
+            if not wasBlocked then
+                logAct('Version blocked by remote list: ' .. tostring(mVer))
+                notify(L'Версия ' .. fmtVer(LOCAL_VERSION) .. L' заблокирована. Требуется обновление!', 0xFF0000)
+            end
+        else
+            if BLOCK.blocked then
+                BLOCK.blocked    = false
+                BLOCK.modal[0]   = false
+                BLOCK.reopenAt   = 0
+                BLOCK.matchedVer = ''
+                logAct('Version unblocked by remote list')
+            end
+        end
+    end)
 end
 
 doCheck = function(silent, thenDownload)
+    if not silent then checkBlockedVersions(true) end
     if updateDownloading then return end
     if not canDownload then
         updaterStatus = L'нет http-транспорта'
@@ -720,16 +809,16 @@ doCheck = function(silent, thenDownload)
 
         local st = applyVersionText(body)
         if st == 'new' then
-            updaterStatus = L'доступно v' .. remoteVersion
-            logAct('Update available: v' .. remoteVersion .. ' (local v' .. LOCAL_VERSION .. ')')
+            updaterStatus = L'доступно ' .. fmtVer(remoteVersion)
+            logAct('Update available: ' .. fmtVer(remoteVersion) .. ' (local ' .. fmtVer(LOCAL_VERSION) .. ')')
             if not silent or promptedVersion ~= remoteVersion then
-                notify(L'Доступно обновление: v' .. remoteVersion, 0xFFAA00)
+                notify(L'Доступно обновление: ' .. fmtVer(remoteVersion), 0xFFAA00)
             end
             if thenDownload then doUpdate() else promptUpdate() end
         elseif st == 'same' then
             updaterStatus = L'последняя версия'
-            logAct('Check ok: up to date (v' .. LOCAL_VERSION .. ')')
-            if not silent then notify(L'У вас последняя версия: v' .. LOCAL_VERSION, 0x00FF00) end
+            logAct('Check ok: up to date (' .. fmtVer(LOCAL_VERSION) .. ')')
+            if not silent then notify(L'У вас последняя версия: ' .. fmtVer(LOCAL_VERSION), 0x00FF00) end
         else
             updaterStatus = L'неверный ответ'
             logAct('Check failed: version.txt = ' .. tostring(body):sub(1, 120))
@@ -756,18 +845,18 @@ doUpdate = function()
     end
 
     updateDownloading = true
-    updaterStatus = L'скачиваю v' .. remoteVersion
+    updaterStatus = L'скачиваю ' .. fmtVer(remoteVersion)
     updProg.pct       = 0.05
     updProg.disp      = 0.02
     updProg.bytes     = 0
     updProg.total     = 0
     updProg.stage     = L'Подключаемся к серверу...'
     updProg.startedAt = os.clock()
-    if not updateModal[0] then
+    if not BLOCK.blocked and not updateModal[0] then
         updateModal[0] = true
         updateModalAlpha = 0
     end
-    notify(L'Скачиваю обновление v' .. remoteVersion .. '...', 0x00CCB3)
+    notify(L'Скачиваю обновление ' .. fmtVer(remoteVersion) .. '...', 0x00CCB3)
 
     lua_thread.create(function()
         local function onDlProgress(status, p1, p2)
@@ -827,7 +916,7 @@ doUpdate = function()
             return
         end
 
-        local dlVer = body:match("script_version%s*%(%s*['\"](%d+%.%d+%.%d+)['\"]")
+        local dlVer = body:match("script_version%s*%(%s*['\"]([a-zA-Z]?%d+%.%d+%.?%d*)['\"]")
         if dlVer and remoteVersion ~= '' and dlVer ~= remoteVersion then
             logAct('Warning: version.txt = ' .. remoteVersion .. ', file = ' .. dlVer)
         end
@@ -889,8 +978,10 @@ doUpdate = function()
         updProg.stage = L'Готово! Перезапускаем скрипт :D'
         updateAvailable   = false
         promptedVersion   = nil
-        updaterStatus     = L'установлено v' .. (dlVer or remoteVersion)
-        logAct('Update installed: v' .. tostring(dlVer or remoteVersion) .. ' -> ' .. tostring(dest))
+        BLOCK.blocked     = false
+        BLOCK.modal[0]    = false
+        updaterStatus     = L'установлено ' .. fmtVer(dlVer or remoteVersion)
+        logAct('Update installed: ' .. fmtVer(dlVer or remoteVersion) .. ' -> ' .. tostring(dest))
         notify(L'Обновление установлено - перезапуск...', 0x00FF00)
         wait(950)
 
@@ -908,7 +999,7 @@ end
 
 local function startUpdateCheck()
     logAct('Updater: transports = ' .. updaterTransportsText()
-        .. ', local v' .. LOCAL_VERSION)
+        .. ', local ' .. fmtVer(LOCAL_VERSION))
     if not canDownload then
         updaterStatus = L'нет http-транспорта'
         logAct('Updater: no transport, auto-check skipped')
@@ -917,7 +1008,10 @@ local function startUpdateCheck()
     lastAutoCheck = os.time()
     lua_thread.create(function()
         wait(AUTO_CHECK_DELAY * 1000)
-        if isSampAvailable() then doCheck(true) end
+        if isSampAvailable() then
+            checkBlockedVersions(true)
+            doCheck(true)
+        end
     end)
 end
 
@@ -1200,6 +1294,7 @@ function sampev.onServerMessage(color, text)
     end
 
     if CFG.catchEnabled
+       and not BLOCK.blocked
        and not isPlayer
        and not hasActiveOrder
        and not tapSequenceActive
@@ -1299,7 +1394,7 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
     local isOrderDialog = (isConfirmTitle and (hasOrderBody or isPendingCatch or isTwoStepConfirm))
                        or (b1N:find(L'принять', 1, true) and hasOrderBody)
 
-    if isOrderDialog and CFG.catchEnabled then
+    if isOrderDialog and CFG.catchEnabled and not BLOCK.blocked then
         if CFG.autoAccept and (isPendingCatch or isTwoStepConfirm) then
             hasActiveOrder         = true
             pendingAccept          = nil
@@ -2143,8 +2238,8 @@ local function SettingsTabFrame()
 
         -- Выделенный бейдж справа вверху (при наличии обновления подсвечивается новая версия)
         local verBadge = updateAvailable
-            and (u8(L'Доступно: v') .. u8(remoteVersion))
-            or  (u8(L'Версия: v') .. LOCAL_VERSION)
+            and (u8(L'Доступно: ') .. u8(fmtVer(remoteVersion)))
+            or  (u8(L'Версия: ') .. fmtVer(LOCAL_VERSION))
         local badgeAccent = updateAvailable and THEME.emerald or THEME.accentBright
         if FONT_BIG then imgui.PushFont(FONT_BIG) end
         local vbs = imgui.CalcTextSize(verBadge)
@@ -2162,7 +2257,7 @@ local function SettingsTabFrame()
 
         -- Крупная строка статуса обновления (шрифт по умолчанию 19px)
         local statusTxt = updateAvailable
-            and (u8(L'Установлена v') .. LOCAL_VERSION .. u8(L'  •  Требуется обновление!'))
+            and (u8(L'Установлена ') .. fmtVer(LOCAL_VERSION) .. u8(L'  |  Требуется обновление!'))
             or  (u8(L'Статус обновлений: ') .. u8(updaterStatus))
         local statusCol = updateAvailable and THEME.emerald or THEME.dim
         DL:AddText(imgui.ImVec2(p.x + SC(20), p.y + SC(54)), CA(statusCol, a), statusTxt)
@@ -2191,7 +2286,7 @@ local function SettingsTabFrame()
         if updateDownloading then
             updText = u8(L'Проверка / загрузка...')
         elseif updateAvailable then
-            updText = u8(L'Обновить сейчас до v') .. u8(remoteVersion)
+            updText = u8(L'Обновить сейчас до ') .. u8(fmtVer(remoteVersion))
         else
             updText = u8(L'Проверить обновления')
         end
@@ -2626,7 +2721,7 @@ end)
 --  РЕНДЕР ОКНА
 -- ============================================================
 imgui.OnFrame(
-    function() return (window[0] or windowAlpha > 0.005) and isSampAvailable() and not isPauseMenuActive() end,
+    function() return (not BLOCK.blocked) and (window[0] or windowAlpha > 0.005) and isSampAvailable() and not isPauseMenuActive() end,
     function(this)
         this.ShowCursor = (window[0] or windowAlpha > 0.35)
         local target = window[0] and 1.0 or 0.0
@@ -2725,8 +2820,8 @@ imgui.OnFrame(
             DrawNeuBox(DL, cx1, cy1, cx2, cy2, SC(14), THEME.card, a)
 
             -- Верхняя строка карточки: сравнение версий
-            local verCur = u8(L'Установлена: v') .. LOCAL_VERSION
-            local verNew = u8(L'Новая: v') .. u8(remoteVersion ~= '' and remoteVersion or '?')
+            local verCur = u8(L'Установлена: ') .. fmtVer(LOCAL_VERSION)
+            local verNew = u8(L'Новая: ') .. u8(fmtVer(remoteVersion))
             DL:AddText(imgui.ImVec2(cx1 + SC(16), cy1 + SC(15)), CA(THEME.dim, a), verCur)
             if FONT_BIG then imgui.PushFont(FONT_BIG) end
             local vns = imgui.CalcTextSize(verNew)
@@ -3042,8 +3137,218 @@ imgui.OnFrame(
 )
 
 -- ============================================================
+--  ПРИНУДИТЕЛЬНОЕ ОКНО БЛОКИРОВКИ УСТАРЕВШЕЙ ВЕРСИИ
+-- ============================================================
+imgui.OnFrame(
+    function() return BLOCK.blocked and (BLOCK.modal[0] or BLOCK.modalAlpha > 0.005) and isSampAvailable() and not isPauseMenuActive() end,
+    function(this)
+        this.ShowCursor = (BLOCK.modal[0] or BLOCK.modalAlpha > 0.35)
+        local target = BLOCK.modal[0] and 1.0 or 0.0
+        BLOCK.modalAlpha = BLOCK.modalAlpha + (target - BLOCK.modalAlpha) * 0.28
+        if math.abs(target - BLOCK.modalAlpha) < 0.01 then BLOCK.modalAlpha = target end
+
+        if BLOCK.modalAlpha <= 0.005 and not BLOCK.modal[0] then
+            BLOCK.modalAlpha = 0
+            return
+        end
+
+        local sw, sh = getScreenResolution()
+        if not sw or sw <= 0 then sw, sh = 1280, 720 end
+
+        local mw = math.min(SC(460), sw - SC(32))
+        local mh = SC(300)
+        local a  = BLOCK.modalAlpha
+
+        imgui.SetNextWindowPos(imgui.ImVec2(sw / 2, sh / 2), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
+        imgui.SetNextWindowSize(imgui.ImVec2(mw, mh), imgui.Cond.Always)
+        imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, math.max(0.01, a))
+
+        local visible = imgui.Begin('##HfJBlockedModal', nil,
+            imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoBackground
+            + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoResize
+            + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoCollapse)
+
+        if visible then
+            local pos = imgui.GetWindowPos()
+            local DL  = imgui.GetWindowDrawList()
+            local R   = SC(18)
+
+            DL:AddRectFilled(
+                imgui.ImVec2(pos.x + SC(5), pos.y + SC(7)),
+                imgui.ImVec2(pos.x + mw + SC(7), pos.y + mh + SC(10)),
+                CA(THEME.shadowDark, 0.88 * a), R + SC(4))
+            DL:AddRectFilled(pos, imgui.ImVec2(pos.x + mw, pos.y + mh), CA(THEME.bg, a), R)
+            DL:AddRect(pos, imgui.ImVec2(pos.x + mw, pos.y + mh),
+                C(imgui.ImVec4(THEME.danger.x, THEME.danger.y, THEME.danger.z, 0.65 * a)), R, 0, SC(1.5))
+
+            -- Тревожная верхняя полоска
+            DL:AddRectFilled(
+                imgui.ImVec2(pos.x + SC(20), pos.y + SC(1)),
+                imgui.ImVec2(pos.x + mw - SC(20), pos.y + SC(4)),
+                CA(THEME.danger, a), SC(2))
+
+            -- Шапка окна блокировки + крестик закрытия
+            local bx, by = pos.x + SC(20), pos.y + SC(18)
+            DL:AddRectFilled(imgui.ImVec2(bx, by), imgui.ImVec2(bx + SC(36), by + SC(36)),
+                C(imgui.ImVec4(THEME.danger.x, THEME.danger.y, THEME.danger.z, 0.22 * a)), SC(10))
+            DrawVectorIcon(DL, 'warn', bx + SC(18), by + SC(18), SC(20),
+                imgui.ImVec4(THEME.danger.x, THEME.danger.y, THEME.danger.z, a))
+            if FONT_BIG then imgui.PushFont(FONT_BIG) end
+            DL:AddText(imgui.ImVec2(bx + SC(48), by + SC(6)), CA(THEME.text, a),
+                updateDownloading and u8(L'Обновление скрипта') or u8(L'Версия заблокирована'))
+            if FONT_BIG then imgui.PopFont() end
+
+            -- Крестик в правом верхнем углу (временно закрывает окно)
+            local closeSz = SC(30)
+            local closeX  = pos.x + mw - closeSz - SC(16)
+            local closeY  = by + SC(3)
+            imgui.SetCursorScreenPos(imgui.ImVec2(closeX, closeY))
+            imgui.InvisibleButton('##hfj_blk_close_x', imgui.ImVec2(closeSz, closeSz))
+            local clkX = imgui.IsItemClicked()
+            local hovX = imgui.IsItemHovered()
+            local ccx, ccy = closeX + closeSz / 2, closeY + closeSz / 2
+            DL:AddCircleFilled(imgui.ImVec2(ccx, ccy), closeSz / 2,
+                CA(hovX and THEME.danger or THEME.card, a), 24)
+            local d = SC(5)
+            local xu32 = hovX and C(imgui.ImVec4(1, 1, 1, a)) or CA(THEME.dim, a)
+            DL:AddLine(imgui.ImVec2(ccx - d, ccy - d), imgui.ImVec2(ccx + d, ccy + d), xu32, SC(1.8))
+            DL:AddLine(imgui.ImVec2(ccx - d, ccy + d), imgui.ImVec2(ccx + d, ccy - d), xu32, SC(1.8))
+
+            -- Внутренняя карточка
+            local cx1, cy1 = pos.x + SC(20), pos.y + SC(68)
+            local cx2, cy2 = pos.x + mw - SC(20), pos.y + SC(216)
+            DrawNeuBox(DL, cx1, cy1, cx2, cy2, SC(14), THEME.card, a)
+
+            local verCur = u8(L'Текущая: ') .. fmtVer(LOCAL_VERSION)
+            local verNew = remoteVersion ~= '' and (u8(L'Доступна: ') .. u8(fmtVer(remoteVersion))) or u8(L'Требуется обнова')
+            DL:AddText(imgui.ImVec2(cx1 + SC(16), cy1 + SC(15)), CA(THEME.danger, a), verCur)
+            if FONT_BIG then imgui.PushFont(FONT_BIG) end
+            local vns = imgui.CalcTextSize(verNew)
+            DL:AddText(imgui.ImVec2(cx2 - vns.x - SC(16), cy1 + SC(13)),
+                CA(remoteVersion ~= '' and THEME.emerald or THEME.warn, a), verNew)
+            if FONT_BIG then imgui.PopFont() end
+
+            DL:AddLine(
+                imgui.ImVec2(cx1 + SC(16), cy1 + SC(46)),
+                imgui.ImVec2(cx2 - SC(16), cy1 + SC(46)),
+                C(imgui.ImVec4(1, 1, 1, 0.06 * a)), SC(1))
+
+            if updateDownloading then
+                updProg.disp = updProg.disp + (updProg.pct - updProg.disp) * 0.22
+                if math.abs(updProg.pct - updProg.disp) < 0.004 then updProg.disp = updProg.pct end
+                local pctVal = math.max(0, math.min(100, math.floor(updProg.disp * 100 + 0.5)))
+
+                DrawVectorIcon(DL, 'spinner', cx1 + SC(26), cy1 + SC(69), SC(18),
+                    imgui.ImVec4(THEME.emerald.x, THEME.emerald.y, THEME.emerald.z, a))
+                DL:AddText(imgui.ImVec2(cx1 + SC(44), cy1 + SC(59)), CA(THEME.text, a), u8(updProg.stage))
+
+                local pctTxt = tostring(pctVal) .. '%'
+                if FONT_BIG then imgui.PushFont(FONT_BIG) end
+                local pts = imgui.CalcTextSize(pctTxt)
+                DL:AddText(imgui.ImVec2(cx2 - pts.x - SC(16), cy1 + SC(56)), CA(THEME.emerald, a), pctTxt)
+                if FONT_BIG then imgui.PopFont() end
+
+                local barX1, barX2 = cx1 + SC(16), cx2 - SC(16)
+                local barY1, barY2 = cy1 + SC(92), cy1 + SC(106)
+                local fillW = (barX2 - barX1) * math.max(0.03, math.min(1, updProg.disp))
+                DL:AddRectFilled(imgui.ImVec2(barX1, barY1), imgui.ImVec2(barX2, barY2), CA(THEME.cardDark, a), SC(7))
+                DL:AddRectFilled(imgui.ImVec2(barX1, barY1), imgui.ImVec2(barX1 + fillW, barY2), CA(THEME.emerald, a), SC(7))
+
+                if FONT_SUB then imgui.PushFont(FONT_SUB) end
+                local kbTxt = updProg.total > 0
+                    and string.format('%.1f / %.1f %s', updProg.bytes / 1024, updProg.total / 1024, u8(L'КБ'))
+                    or  string.format('%.1f %s', updProg.bytes / 1024, u8(L'КБ загружено'))
+                DL:AddText(imgui.ImVec2(barX1, cy1 + SC(116)), CA(THEME.dim, a), kbTxt)
+                if FONT_SUB then imgui.PopFont() end
+            else
+                DL:AddText(imgui.ImVec2(cx1 + SC(16), cy1 + SC(60)), CA(THEME.text, a),
+                    u8(L'Эта версия скрипта отключена на сервере.'))
+                DL:AddText(imgui.ImVec2(cx1 + SC(16), cy1 + SC(88)), CA(THEME.dim, a),
+                    u8(L'Доступ к меню закрыт до обновления.'))
+                if FONT_SUB then imgui.PushFont(FONT_SUB) end
+                DL:AddText(imgui.ImVec2(cx1 + SC(16), cy1 + SC(116)), CA(THEME.warn, 0.9 * a),
+                    u8(L'При закрытии окно появится снова через 60 сек.'))
+                if FONT_SUB then imgui.PopFont() end
+            end
+
+            -- Нижние кнопки: Обновить и Закрыть
+            local gap = SC(12)
+            local btnW = (mw - SC(40) - gap) / 2
+            local btnH = SC(48)
+            local btnY = pos.y + mh - btnH - SC(18)
+
+            imgui.SetCursorScreenPos(imgui.ImVec2(pos.x + SC(20), btnY))
+            imgui.InvisibleButton('##hfj_blk_upd', imgui.ImVec2(btnW, btnH))
+            local clkUpd = imgui.IsItemClicked()
+            local hovUpd = imgui.IsItemHovered()
+            if clkUpd and not updateDownloading then
+                if updateAvailable then doUpdate() else doCheck(false, true) end
+            end
+            local updBg = updateDownloading
+                and THEME.tile
+                or  (hovUpd and THEME.emerald or LerpVec4(THEME.accent, THEME.emerald, 0.45))
+            DrawNeuBox(DL, pos.x + SC(20), btnY, pos.x + SC(20) + btnW, btnY + btnH, SC(12),
+                updBg, a, THEME.emerald)
+            local updLbl = updateDownloading
+                and (tostring(math.max(0, math.min(100, math.floor(updProg.disp * 100 + 0.5)))) .. '%')
+                or  u8(L'Обновить')
+            if FONT_BIG then imgui.PushFont(FONT_BIG) end
+            local uls = imgui.CalcTextSize(updLbl)
+            DL:AddText(
+                imgui.ImVec2(pos.x + SC(20) + (btnW - uls.x) / 2, btnY + (btnH - uls.y) / 2),
+                CA(updateDownloading and THEME.emerald or imgui.ImVec4(0.04, 0.08, 0.07, 1.0), a),
+                updLbl)
+            if FONT_BIG then imgui.PopFont() end
+
+            local bx2 = pos.x + SC(20) + btnW + gap
+            imgui.SetCursorScreenPos(imgui.ImVec2(bx2, btnY))
+            imgui.InvisibleButton('##hfj_blk_close', imgui.ImVec2(btnW, btnH))
+            local clkClose = imgui.IsItemClicked()
+            local hovClose = imgui.IsItemHovered()
+            if clkClose or clkX then
+                BLOCK.modal[0] = false
+                BLOCK.reopenAt = os.clock() + BLOCK.REOPEN_DELAY
+                if not updateDownloading then
+                    notify(L'Версия заблокирована. Окно вернётся через 60 сек', 0xFFAA00)
+                end
+            end
+            DrawNeuBox(DL, bx2, btnY, bx2 + btnW, btnY + btnH, SC(12),
+                hovClose and THEME.tileHover or THEME.tile, a,
+                imgui.ImVec4(1, 1, 1, 0.08))
+            local clsLbl = u8(L'Закрыть')
+            if FONT_BIG then imgui.PushFont(FONT_BIG) end
+            local cls = imgui.CalcTextSize(clsLbl)
+            DL:AddText(
+                imgui.ImVec2(bx2 + (btnW - cls.x) / 2, btnY + (btnH - cls.y) / 2),
+                CA(THEME.text, a), clsLbl)
+            if FONT_BIG then imgui.PopFont() end
+        end
+        imgui.End()
+        imgui.PopStyleVar()
+    end
+)
+
+-- ============================================================
 --  MAIN
 -- ============================================================
+local function tickUpdateAndBlock(now)
+    if canDownload and not updateDownloading
+       and (os.time() - lastAutoCheck) >= AUTO_CHECK_EVERY then
+        lastAutoCheck = os.time()
+        checkBlockedVersions(true)
+        doCheck(true)
+    end
+
+    if BLOCK.blocked then
+        if window[0] then window[0] = false end
+        if not BLOCK.modal[0] and BLOCK.reopenAt > 0 and now >= BLOCK.reopenAt then
+            BLOCK.modal[0]   = true
+            BLOCK.modalAlpha = 0
+            logAct('Blocked version modal reopened after cooldown')
+        end
+    end
+end
+
 function main()
     while not isSampAvailable() do wait(200) end
 
@@ -3051,9 +3356,16 @@ function main()
 
     logInit()
     loadCfg()
-    logAct('Script loaded. v' .. VERSION .. ' (utf8_file=' .. tostring(FILE_IS_UTF8) .. ')')
+    logAct('Script loaded. ' .. fmtVer(VERSION) .. ' (utf8_file=' .. tostring(FILE_IS_UTF8) .. ')')
 
     local function toggleMenu()
+        if BLOCK.blocked then
+            window[0]        = false
+            BLOCK.modal[0]   = true
+            BLOCK.modalAlpha = 0
+            notify(L'Эта версия заблокирована. Требуется обновление', 0xFF0000)
+            return
+        end
         if window[0] then
             window[0] = false
         else
@@ -3095,13 +3407,14 @@ function main()
     end)
     sampRegisterChatCommand('update', function() doUpdate() end)
     sampRegisterChatCommand('updinfo', function()
-        notify(L'Версия: v' .. LOCAL_VERSION ..
-            L' | Сервер: v' .. (remoteVersion ~= '' and remoteVersion or '?'), 0x00CCB3)
+        notify(L'Версия: ' .. fmtVer(LOCAL_VERSION) ..
+            L' | Сервер: ' .. fmtVer(remoteVersion), 0x00CCB3)
         notify(L'Транспорты: ' .. updaterTransportsText(), 0x00CCB3)
-        notify(L'Статус: ' .. updaterStatus, 0x00CCB3)
+        notify(L'Статус: ' .. updaterStatus
+            .. (BLOCK.blocked and L' | БЛОКИРОВКА АКТИВНА' or ''), 0x00CCB3)
     end)
 
-    notify(L'Help for Job ' .. VERSION .. L' загружен, /hfj - меню', 0x00FF00)
+    notify(L'Help for Job ' .. fmtVer(VERSION) .. L' загружен, /hfj - меню', 0x00FF00)
     startUpdateCheck()
 
     lua_thread.create(function()
@@ -3126,12 +3439,7 @@ function main()
         wait(0)
         local now = os.clock()
 
-        -- Тихая проверка обновлений раз в 30 минут
-        if canDownload and not updateDownloading
-           and (os.time() - lastAutoCheck) >= AUTO_CHECK_EVERY then
-            lastAutoCheck = os.time()
-            doCheck(true)
-        end
+        tickUpdateAndBlock(now)
 
         if cfgDirty and (now - lastAutoSave) > 1.5 then
             lastAutoSave = now; saveCfg()
