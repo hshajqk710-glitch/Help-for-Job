@@ -1,10 +1,10 @@
 -- Help_for_Job.lua
--- MonetLoader 3.8.x / MoonLoader
--- Help for Job (HfJ) - автоловля заказов + учёт зарплаты по работам + автообновление
--- v30.0.1 (HfJ Automotive Dashboard)
+-- MonetLoader 3.8.x / Neom Loader / MoonLoader
+-- Help for Job (HfJ) - автоловля заказов такси + учёт заработка по работам
+-- c1.7 (HfJ Automotive Dashboard)
 
 script_name('HfJ')
-script_version('30.0.1')
+script_version('c1.7')
 
 local imgui    = require 'mimgui'
 local new      = imgui.new
@@ -13,7 +13,7 @@ encoding.default = 'CP1251'
 local u8 = encoding.UTF8
 local sampev = require 'samp.events'
 
-local VERSION       = '30.0.1'
+local VERSION       = 'c1.7'
 local LOCAL_VERSION = VERSION
 
 -- ============================================================
@@ -41,6 +41,17 @@ local function utf8ToCp1251(s)
             else
                 out[#out + 1] = string.char(b1); i = i + 1
             end
+        elseif b1 == 0xE2 and i + 2 <= n then
+            local b2, b3 = s:byte(i + 1), s:byte(i + 2)
+            if b2 == 0x80 and b3 == 0x94 then
+                out[#out + 1] = '-'; i = i + 3
+            elseif b2 == 0x80 and b3 == 0x93 then
+                out[#out + 1] = '-'; i = i + 3
+            elseif b2 == 0x80 and b3 == 0xA2 then
+                out[#out + 1] = '|'; i = i + 3
+            else
+                out[#out + 1] = string.char(b1); i = i + 1
+            end
         else
             out[#out + 1] = string.char(b1); i = i + 1
         end
@@ -56,12 +67,27 @@ end
 -- ============================================================
 --  КОНСТАНТЫ
 -- ============================================================
-local MAX_TAPS              = 15
-local TAP_STEP_MS           = 55
-local ACCEPT_DELAY_MIN      = 40
-local ACCEPT_DELAY_MAX      = 90
-local TAP_COOLDOWN          = 400
-local PENDING_TIMEOUT       = 15.0
+local CATCH = {
+    MAX_TAPS_NORMAL  = 1,    -- 1-2 точных тапа (0 + резерв 1 при отсутствии ответа)
+    MAX_TAPS_TURBO   = 1,    -- 1-2 точных тапа без спама 15 диалогами подряд
+    REACT_DELAY_MIN  = 30,   -- быстрая живая реакция перед 1-м тапом (мс)
+    REACT_DELAY_MAX  = 60,
+    TAP_STEP_MIN     = 220,  -- пауза до резервного 2-го тапа в обычном режиме (мс)
+    TAP_STEP_MAX     = 320,
+    TAP_STEP_TURBO   = 180,  -- пауза до резервного 2-го тапа в Турбо (мс)
+    ACCEPT_DELAY_MIN = 35,   -- быстрое живое подтверждение «Принять» (мс)
+    ACCEPT_DELAY_MAX = 70,
+    TAP_COOLDOWN     = 250,
+    PENDING_TIMEOUT  = 15.0,
+}
+
+local function humanDelayMs(minMs, maxMs)
+    local mid = math.floor((minMs + maxMs) / 2)
+    local r1 = math.random(minMs, mid)
+    local r2 = math.random(mid, maxMs)
+    local jitter = math.random(-5, 5)
+    return math.max(minMs, math.min(maxMs, math.floor((r1 + r2) / 2) + jitter))
+end
 
 local ORDER_PATTERNS = {
     L'поступил новый заказ',
@@ -79,7 +105,6 @@ local ORDER_PATTERNS = {
 -- ============================================================
 local cfgDirty     = false
 local lastAutoSave = 0
-local FONT_LOGO    = nil
 local FONT_SUB     = nil
 local FONT_BIG     = nil
 local FONT_HERO    = nil
@@ -135,7 +160,27 @@ local LOG_FILE    = LOG_DIR .. '/hfj.log'
 if not doesDirectoryExist(CONFIG_DIR) then pcall(createDirectory, CONFIG_DIR) end
 if not doesDirectoryExist(LOG_DIR)    then pcall(createDirectory, LOG_DIR)    end
 
+local LOG_BUF = {}
+local LOG_LAST_FLUSH = 0
+
+local function flushLogBuffer(force)
+    if #LOG_BUF == 0 then return end
+    local now = os.clock()
+    if not force and #LOG_BUF < 20 and (now - LOG_LAST_FLUSH) < 2.0 then return end
+    local f = io.open(LOG_FILE, 'a')
+    if f then
+        f:write(table.concat(LOG_BUF))
+        f:close()
+    end
+    LOG_BUF = {}
+    LOG_LAST_FLUSH = now
+end
+
 local function logRaw(tag, msg)
+    local tagStr = tostring(tag or 'INFO')
+    -- Пропускаем пустые строки чата, чтобы не нагружать память и диск
+    if tagStr == 'CHAT' and (msg == nil or tostring(msg):match('^%s*$')) then return end
+
     local ms = 0
     if type(getTickCount) == 'function' then
         ms = getTickCount() % 1000
@@ -145,30 +190,33 @@ local function logRaw(tag, msg)
     local timeStr = os.date('%H:%M:%S.') .. string.format('%03d', ms)
     local line
     if msg == nil then
-        line = string.format('%s | %s', timeStr, tostring(tag or ''))
+        line = string.format('%s | %s', timeStr, tagStr)
     else
-        line = string.format('%s | %-5s | %s', timeStr, tostring(tag or 'INFO'), tostring(msg))
+        line = string.format('%s | %-5s | %s', timeStr, tagStr, tostring(msg))
     end
 
-    print('[HfJ] ' .. line)
+    -- В консоль/neomloader пишем только важные действия и ошибки (без флуда чата/диалогов)
+    if tagStr == 'ACT' or tagStr == 'ERROR' then
+        print('[HfJ] ' .. line)
+    end
 
-    local f = io.open(LOG_FILE, 'a')
-    if f then
-        f:write(u8(line) .. '\n')
-        f:close()
+    LOG_BUF[#LOG_BUF + 1] = u8(line) .. '\n'
+    if tagStr == 'ERROR' or #LOG_BUF >= 20 then
+        flushLogBuffer(true)
     end
 end
 
 -- Очистка файла лога при первом запуске и дописывание при реконнекте
 local function logInit(reason)
+    flushLogBuffer(true)
     local isInitial = (reason == nil)
     local mode = isInitial and 'w' or 'a'
     local f = io.open(LOG_FILE, mode)
     if f then
         if not isInitial then f:write('\n') end
         f:write('============================================================\n')
-        f:write('=== Help for Job v' .. VERSION .. ' | ' .. os.date('%d.%m.%Y %H:%M:%S') .. ' ===\n')
-        f:write('=== Сессия: ' .. tostring(reason or 'Запуск скрипта') .. '\n')
+        f:write('=== Help for Job ' .. VERSION .. ' | ' .. os.date('%d.%m.%Y %H:%M:%S') .. ' ===\n')
+        f:write(u8(L'=== Сессия: ' .. tostring(reason or L'Запуск скрипта')) .. '\n')
         f:write('============================================================\n')
         f:close()
     end
@@ -183,34 +231,38 @@ local function logErr(t)  logRaw('ERROR', t) end
 --  КОНФИГ И СТАТИСТИКА
 -- ============================================================
 local CFG = {
-    catchEnabled = true,
-    autoAccept   = true,
-    turboCatch   = false, -- Турбо-ловля (0 мс)
-    ordersDone   = 0,
-    moneyEarned  = 0,
+    catchEnabled  = true,
+    autoAccept    = true,
+    turboCatch    = false, -- Турбо-ловля (0 мс)
+    useLogTracker = true,  -- Учёт через neomloader.log (Packet 220 HUD balance)
+    ordersDone    = 0,
+    moneyEarned   = 0,
 }
 
-local ZP = { taxi = 0, trucker = 0, collector = 0, deliverer = 0, mechanic = 0, bus = 0, garbage = 0 }
-local zpLastX, zpLastY, zpLastZ = nil, nil, nil
-local zpMovedDist = 0.0
+local ZP = {
+    taxi = 0, roadworker = 0, trucker = 0, collector = 0,
+    deliverer = 0, mechanic = 0, bus = 0, garbage = 0,
+}
 
 local function markDirty() cfgDirty = true end
 
 local function saveCfg()
     local f = io.open(CONFIG_FILE, 'w')
     if not f then return false end
-    f:write('catchEnabled=' .. tostring(CFG.catchEnabled) .. '\n')
-    f:write('autoAccept='   .. tostring(CFG.autoAccept)   .. '\n')
-    f:write('turboCatch='   .. tostring(CFG.turboCatch)   .. '\n')
-    f:write('ordersDone='   .. tostring(CFG.ordersDone)   .. '\n')
-    f:write('moneyEarned='  .. tostring(CFG.moneyEarned)  .. '\n')
-    f:write('zpTaxi='       .. tostring(math.floor(ZP.taxi))      .. '\n')
-    f:write('zpTrucker='    .. tostring(math.floor(ZP.trucker))   .. '\n')
-    f:write('zpCollector='  .. tostring(math.floor(ZP.collector)) .. '\n')
-    f:write('zpDeliverer='  .. tostring(math.floor(ZP.deliverer)) .. '\n')
-    f:write('zpMechanic='   .. tostring(math.floor(ZP.mechanic))  .. '\n')
-    f:write('zpBus='        .. tostring(math.floor(ZP.bus))       .. '\n')
-    f:write('zpGarbage='    .. tostring(math.floor(ZP.garbage))   .. '\n')
+    f:write('catchEnabled='  .. tostring(CFG.catchEnabled)  .. '\n')
+    f:write('autoAccept='    .. tostring(CFG.autoAccept)    .. '\n')
+    f:write('turboCatch='    .. tostring(CFG.turboCatch)    .. '\n')
+    f:write('useLogTracker=' .. tostring(CFG.useLogTracker) .. '\n')
+    f:write('ordersDone='    .. tostring(CFG.ordersDone)    .. '\n')
+    f:write('moneyEarned='   .. tostring(CFG.moneyEarned)   .. '\n')
+    f:write('zpTaxi='        .. tostring(math.floor(ZP.taxi))       .. '\n')
+    f:write('zpRoadworker='  .. tostring(math.floor(ZP.roadworker)) .. '\n')
+    f:write('zpTrucker='     .. tostring(math.floor(ZP.trucker))    .. '\n')
+    f:write('zpCollector='   .. tostring(math.floor(ZP.collector))  .. '\n')
+    f:write('zpDeliverer='   .. tostring(math.floor(ZP.deliverer))  .. '\n')
+    f:write('zpMechanic='    .. tostring(math.floor(ZP.mechanic))   .. '\n')
+    f:write('zpBus='         .. tostring(math.floor(ZP.bus))        .. '\n')
+    f:write('zpGarbage='     .. tostring(math.floor(ZP.garbage))    .. '\n')
     f:close()
     cfgDirty = false
     return true
@@ -224,18 +276,20 @@ local function loadCfg()
         local k, v = line:match('^([^=]+)=(.*)$')
         if k and v then
             local n = tonumber(v)
-            if k == 'catchEnabled' then CFG.catchEnabled = (v == 'true') end
-            if k == 'autoAccept'   then CFG.autoAccept   = (v == 'true') end
-            if k == 'turboCatch'   then CFG.turboCatch   = (v == 'true') end
-            if k == 'ordersDone'   and n then CFG.ordersDone  = n end
-            if k == 'moneyEarned'  and n then CFG.moneyEarned = n end
-            if k == 'zpTaxi'       and n then ZP.taxi         = n end
-            if k == 'zpTrucker'    and n then ZP.trucker      = n end
-            if k == 'zpCollector'  and n then ZP.collector    = n end
-            if k == 'zpDeliverer'  and n then ZP.deliverer    = n end
-            if k == 'zpMechanic'   and n then ZP.mechanic     = n end
-            if k == 'zpBus'        and n then ZP.bus          = n end
-            if k == 'zpGarbage'    and n then ZP.garbage      = n end
+            if k == 'catchEnabled'  then CFG.catchEnabled  = (v == 'true') end
+            if k == 'autoAccept'    then CFG.autoAccept    = (v == 'true') end
+            if k == 'turboCatch'    then CFG.turboCatch    = (v == 'true') end
+            if k == 'useLogTracker' then CFG.useLogTracker = (v == 'true') end
+            if k == 'ordersDone'    and n then CFG.ordersDone  = n end
+            if k == 'moneyEarned'   and n then CFG.moneyEarned = n end
+            if k == 'zpTaxi'        and n then ZP.taxi         = n end
+            if k == 'zpRoadworker'  and n then ZP.roadworker   = n end
+            if k == 'zpTrucker'     and n then ZP.trucker      = n end
+            if k == 'zpCollector'   and n then ZP.collector    = n end
+            if k == 'zpDeliverer'   and n then ZP.deliverer    = n end
+            if k == 'zpMechanic'    and n then ZP.mechanic     = n end
+            if k == 'zpBus'         and n then ZP.bus          = n end
+            if k == 'zpGarbage'     and n then ZP.garbage      = n end
         end
     end
     f:close()
@@ -261,18 +315,17 @@ local function zpExtractMoney(text)
         local n = tonumber((raw:gsub('[%.,]', '')))
         if n and n > 0 then return n end
     end
-    local maxVal = 0
-    for match in text:gmatch('(%d[%d%.,]*)') do
-        local cleaned = match:gsub('[%.,]', '')
-        local n = tonumber(cleaned)
-        if n and n > maxVal then maxVal = n end
-    end
-    return maxVal > 0 and maxVal or nil
+    return nil
 end
 
 local function zpDetectJob(textN)
     if textN:find(L'инкассатор', 1, true) then return 'collector' end
     if textN:find(L'развозчик', 1, true) then return 'deliverer' end
+
+    -- Ремонтник дорог
+    if textN:find(L'ремонтник', 1, true)
+       or textN:find(L'дорожного ремонта', 1, true)
+       or textN:find(L'дорожных ям', 1, true) then return 'roadworker' end
 
     -- Мусорщик (проверяем ДО дальнобойщика, чтобы "разгруженные" не совпало с "груз")
     if textN:find(L'мусор', 1, true)
@@ -289,23 +342,19 @@ local function zpDetectJob(textN)
     if textN:find(L'механик', 1, true)
        or textN:find(L'автомастерская', 1, true)
        or textN:find(L'автосервис', 1, true)
-       or textN:find(L'ремонт автомобил', 1, true)
-       or textN:find(L'починил', 1, true)
+       or textN:find(L'доставили авто', 1, true)
        or textN:find(L'за ремонт', 1, true)
-       or textN:find(L'выполненную работу', 1, true)
-       or textN:find(L'масло', 1, true) then return 'mechanic' end
+       or textN:find(L'выполненную работу', 1, true) then return 'mechanic' end
 
     -- Дальнобойщик
     if textN:find(L'дальнобой', 1, true)
        or textN:find(L'грузовик', 1, true)
        or textN:find(L'грузоперевоз', 1, true)
-       or textN:find(L'гауз', 1, true)
        or textN:find(L'груз', 1, true)
        or textN:find(L'рейс', 1, true) then return 'trucker' end
 
     if textN:find(L'такси', 1, true)
-       or textN:find(L'клиент оплатил', 1, true)
-       or textN:find(L'проезд', 1, true) then return 'taxi' end
+       or textN:find(L'клиент оплатил', 1, true) then return 'taxi' end
     return nil
 end
 
@@ -315,8 +364,15 @@ local function zpIsPayout(textN)
        or textN:find(L'вы потратили', 1, true)
        or textN:find(L'списано', 1, true)
        or textN:find(L'снято', 1, true)
+       or textN:find(L'арендовали', 1, true)
        or textN:find(L'починил ваш', 1, true)
-       or textN:find(L'починила ваш', 1, true) then
+       or textN:find(L'починила ваш', 1, true)
+       or textN:find(L'[подсказка]', 1, true)
+       or textN:find(L'текущая сумма в банке', 1, true)
+       or textN:find(L'текущая сумма на депозите', 1, true)
+       or textN:find(L'общая заработная плата', 1, true)
+       or textN:find(L'чаевых', 1, true)
+       or textN:find(L'премия за работу таксистом', 1, true) then
         return false
     end
 
@@ -325,10 +381,11 @@ local function zpIsPayout(textN)
     if textN:find(L'получено за обслуживание', 1, true) then return true end
     if textN:find(L'за обслуживание банкомата', 1, true) then return true end
     if textN:find(L'премия за доставку', 1, true) then return true end
-    if textN:find(L'за ремонт', 1, true) then return true end
-    if textN:find(L'починил', 1, true) then return true end
+    if textN:find(L'вы успешно доставили авто', 1, true) then return true end
     if textN:find(L'оплата за ремонт', 1, true) then return true end
+    if textN:find(L'за ремонт', 1, true) and textN:find(L'получили', 1, true) then return true end
     if textN:find(L'груз успешно доставлен', 1, true) then return true end
+    if textN:find(L'завершили работу ремонтника дорог', 1, true) then return true end
 
     -- Для механика
     if textN:find(L'заработали', 1, true) and textN:find(L'за выполненную работу', 1, true) then return true end
@@ -365,14 +422,19 @@ local function acquireNotifyLock(dur)
 end
 
 local sn = {
-    queue   = {},
-    message = '',
-    icon    = 'info',
-    timer   = 0,
-    dur     = NOTIFY_DURATION,
-    anim    = 0,
-    state   = 'idle',
-    version = 0,
+    queue     = {},
+    message   = '',
+    icon      = 'info',
+    timer     = 0,
+    dur       = NOTIFY_DURATION,
+    anim      = 0,
+    animStart = 0,
+    animFrom  = 0,
+    animTo    = 0,
+    animDur   = 0,
+    animEase  = 'outQuart',
+    state     = 'idle',
+    version   = 0,
 }
 
 local Easing = {
@@ -383,19 +445,13 @@ local Easing = {
     end,
 }
 
-local function bringFloatTo(from, dest, t0, dur, ease, cb)
-    local f = Easing[ease] or function(x) return x end
-    local start = t0 or os.clock()
-    if type(cb) == 'function' then
-        lua_thread.create(function()
-            while true do
-                local t = os.clock() - start
-                if t < 0 or t > dur then cb(dest); break end
-                cb(from + (dest - from) * f(t / dur))
-                wait(0)
-            end
-        end)
-    end
+local function startToastAnim(from, dest, dur, ease)
+    sn.animFrom  = from
+    sn.animTo    = dest
+    sn.animStart = os.clock()
+    sn.animDur   = dur or 0.20
+    sn.animEase  = ease or 'outQuart'
+    sn.anim      = from
 end
 
 local function iconFromColor(color)
@@ -430,10 +486,7 @@ local function notify(text, color)
         sn.version = sn.version + 1
         sn.queue   = {}
         acquireNotifyLock(NOTIFY_DURATION)
-        local myv = sn.version
-        bringFloatTo(sn.anim, 1, now, NOTIFY_ANIM_IN, 'outQuart', function(f)
-            if sn.version == myv then sn.anim = f end
-        end)
+        startToastAnim(sn.anim, 1, NOTIFY_ANIM_IN, 'outQuart')
         return
     end
 
@@ -483,25 +536,13 @@ local hasSecureHttp  = (okHttps and https ~= nil)
 
 local canDownload = hasRawDownload or hasRequests or hasSecureHttp
 
-local BLOCK = {
-    URL_PRIMARY  = ('https://raw.githubusercontent.com/%s/%s/%s/blocked_versions.txt'):format(GH_USER, GH_REPO, GH_BRANCH),
-    URL_FALLBACK = ('https://raw.githubusercontent.com/%s/%s/%s/blocked_versions/blocked_versions.txt'):format(GH_USER, GH_REPO, GH_BRANCH),
-    REOPEN_DELAY = 60,     -- через сколько секунд вернуть закрытое окно блокировки
-    blocked      = false,
-    modal        = new.bool(false),
-    modalAlpha   = 0,
-    reopenAt     = 0,
-    checking     = false,
-    matchedVer   = '',
-}
-
 local function updaterTransportsText()
     local list = {}
+    if hasRawDownload then list[#list + 1] = 'downloadUrlToFile' end
     if hasRequests    then list[#list + 1] = 'requests' end
     if hasSecureHttp  then list[#list + 1] = 'ssl.https' end
     if okHttp and http then list[#list + 1] = 'socket.http' end
-    if hasRawDownload then list[#list + 1] = 'downloadUrlToFile' end
-    if #list == 0 then return 'нет' end
+    if #list == 0 then return L'нет' end
     return table.concat(list, ', ')
 end
 
@@ -509,7 +550,7 @@ local function urlNoCache(url)
     return url .. (url:find('?', 1, true) and '&' or '?') .. 'nocache=' .. tostring(os.time())
 end
 
--- Сравнение версий обоих форматов: "30.0.0" < "30.0.1" < "c1.7" < "c1.10"
+-- Сравнение версий формата a1.0 / a1.0.1 / c1.10 > c1.9 (и совместимость со старыми 30.1.0)
 local function parseVer(s)
     local clean = tostring(s or ''):gsub('%s+', ''):gsub('^[vV]', '')
     local gen, maj, min, hot = clean:match('^([a-zA-Z]?)(%d+)%.(%d+)%.?(%d*)$')
@@ -568,7 +609,7 @@ local function socketRequestOnce(url, onProgress)
     local isHttps = url:match('^https') ~= nil
     local lib = isHttps and https or http
     if not lib then
-        return nil, nil, isHttps and 'нет ssl.https' or 'нет socket.http'
+        return nil, nil, isHttps and L'нет ssl.https' or L'нет socket.http'
     end
 
     local opts = { url = url, sink = sink, method = 'GET' }
@@ -590,7 +631,7 @@ local function socketFetch(url, onProgress)
     for attempt = 1, 4 do
         local text, code, err, location = socketRequestOnce(current, onProgress)
         if text then
-            if text == '' then return nil, 'пустой ответ' end
+            if text == '' then return nil, L'пустой ответ' end
             return text
         end
         if location and (code == 301 or code == 302 or code == 303 or code == 307) then
@@ -603,7 +644,7 @@ local function socketFetch(url, onProgress)
             return nil, err or ('HTTP ' .. tostring(code))
         end
     end
-    return nil, 'слишком много редиректов'
+    return nil, L'слишком много редиректов'
 end
 
 local function rawFetch(url, timeout, onProgress)
@@ -619,7 +660,7 @@ local function rawFetch(url, timeout, onProgress)
         end
         if status == DS_END then finished = true end
     end)
-    if not ok then return nil, 'downloadUrlToFile недоступен' end
+    if not ok then return nil, L'downloadUrlToFile недоступен' end
     local t0 = os.time()
     local nextPoll = os.clock() + 0.10
     while not finished and (os.time() - t0) < (timeout or DOWNLOAD_TIMEOUT) do
@@ -636,19 +677,19 @@ local function rawFetch(url, timeout, onProgress)
     end
     local content = finished and readFile(tmp) or nil
     os.remove(tmp)
-    if not content or content == '' then return nil, 'таймаут downloadUrlToFile' end
+    if not content or content == '' then return nil, L'таймаут downloadUrlToFile' end
     return content
 end
 
 local function requestsFetch(url, onProgress)
-    if not hasRequests then return nil, 'нет requests' end
+    if not hasRequests then return nil, L'нет requests' end
     if type(onProgress) == 'function' then onProgress(2, 0, 0) end
     local ok, resp = pcall(requestsLib.request, 'GET', urlNoCache(url))
     if not ok or not resp then return nil, 'requests: ' .. tostring(resp) end
     local code = tonumber(resp.status_code) or 0
     if code ~= 200 then return nil, 'requests HTTP ' .. tostring(code) end
     local body = resp.text or resp.content
-    if not body or body == '' then return nil, 'requests: пустой ответ' end
+    if not body or body == '' then return nil, L'requests: пустой ответ' end
     if type(onProgress) == 'function' then onProgress(DS_END, #body, #body) end
     return body
 end
@@ -675,7 +716,7 @@ local function fetchText(url, timeout, onProgress)
         logAct('Fetch fail (downloadUrlToFile): ' .. tostring(err))
     end
 
-    if #errors == 0 then return nil, 'нет транспорта' end
+    if #errors == 0 then return nil, L'нет транспорта' end
     return nil, table.concat(errors, ' | ')
 end
 
@@ -683,31 +724,11 @@ local function applyVersionText(text)
     local raw = tostring(text or ''):gsub('^\239\187\191', '')
     if #raw > 200 then return 'err' end
     local cleaned = raw:gsub('%s+', '')
-    local ver = cleaned:match('^[vV]?([a-zA-Z]?%d+%.%d+%.?%d*)$')
+    local ver = cleaned:match('^v?([a-zA-Z]?%d+%.%d+%.?%d*)$')
     if not ver then return 'err' end
     remoteVersion = ver
     updateAvailable = verLt(LOCAL_VERSION, ver)
     return updateAvailable and 'new' or 'same'
-end
-
-local function normVerToken(s)
-    return tostring(s or ''):gsub('%s+', ''):gsub('^[vV]', ''):lower()
-end
-
-local function checkBlockedText(body)
-    local raw = tostring(body or ''):gsub('^\239\187\191', '')
-    if raw:lower():find('<html', 1, true) then return false, '' end
-    local localTok = normVerToken(LOCAL_VERSION)
-    for line in (raw .. '\n'):gmatch('([^\r\n]*)\r?\n') do
-        local cleanLine = line:gsub('#.*$', ''):gsub('%-%-.*$', '')
-        for part in (cleanLine .. ','):gmatch('([^,]*),') do
-            local tok = normVerToken(part)
-            if tok ~= '' and tok == localTok then
-                return true, part:gsub('^%s+', ''):gsub('%s+$', '')
-            end
-        end
-    end
-    return false, ''
 end
 
 local function scriptPath()
@@ -719,11 +740,10 @@ local function scriptPath()
     return nil
 end
 
-local doCheck, doUpdate, checkBlockedVersions
+local doCheck, doUpdate
 
 -- Открываем фирменное стилизованное окно обновления
 local function promptUpdate()
-    if BLOCK.blocked then return end
     if not updateAvailable then return end
     if promptedVersion == remoteVersion then return end
     promptedVersion = remoteVersion
@@ -732,55 +752,7 @@ local function promptUpdate()
     logAct('Update modal opened for ' .. fmtVer(remoteVersion))
 end
 
-checkBlockedVersions = function(silent)
-    if BLOCK.checking or not canDownload then return end
-    BLOCK.checking = true
-    lua_thread.create(function()
-        local ok, body, err = pcall(fetchText, BLOCK.URL_PRIMARY, 12)
-        if not ok or not body or body:lower():find('<html', 1, true) then
-            local ok2, body2, err2 = pcall(fetchText, BLOCK.URL_FALLBACK, 12)
-            if ok2 and body2 and not body2:lower():find('<html', 1, true) then
-                body, err = body2, err2
-            elseif not ok then
-                body, err = nil, tostring(body)
-            end
-        end
-        BLOCK.checking = false
-
-        if not body then
-            logAct('Blocked-versions check skipped: ' .. tostring(err))
-            return
-        end
-
-        local isBlk, mVer = checkBlockedText(body)
-        if isBlk then
-            local wasBlocked = BLOCK.blocked
-            BLOCK.blocked    = true
-            BLOCK.matchedVer = mVer
-            window[0]        = false
-            updateModal[0]   = false
-            if not BLOCK.modal[0] then
-                BLOCK.modal[0]   = true
-                BLOCK.modalAlpha = 0
-            end
-            if not wasBlocked then
-                logAct('Version blocked by remote list: ' .. tostring(mVer))
-                notify(L'Версия ' .. fmtVer(LOCAL_VERSION) .. L' заблокирована. Требуется обновление!', 0xFF0000)
-            end
-        else
-            if BLOCK.blocked then
-                BLOCK.blocked    = false
-                BLOCK.modal[0]   = false
-                BLOCK.reopenAt   = 0
-                BLOCK.matchedVer = ''
-                logAct('Version unblocked by remote list')
-            end
-        end
-    end)
-end
-
 doCheck = function(silent, thenDownload)
-    if not silent then checkBlockedVersions(true) end
     if updateDownloading then return end
     if not canDownload then
         updaterStatus = L'нет http-транспорта'
@@ -852,7 +824,7 @@ doUpdate = function()
     updProg.total     = 0
     updProg.stage     = L'Подключаемся к серверу...'
     updProg.startedAt = os.clock()
-    if not BLOCK.blocked and not updateModal[0] then
+    if not updateModal[0] then
         updateModal[0] = true
         updateModalAlpha = 0
     end
@@ -916,7 +888,7 @@ doUpdate = function()
             return
         end
 
-        local dlVer = body:match("script_version%s*%(%s*['\"]([a-zA-Z]?%d+%.%d+%.?%d*)['\"]")
+        local dlVer = body:match("script_version%s*%(%s*['\"](v?[a-zA-Z]?%d+%.%d+%.?%d*)['\"]")
         if dlVer and remoteVersion ~= '' and dlVer ~= remoteVersion then
             logAct('Warning: version.txt = ' .. remoteVersion .. ', file = ' .. dlVer)
         end
@@ -978,8 +950,6 @@ doUpdate = function()
         updProg.stage = L'Готово! Перезапускаем скрипт :D'
         updateAvailable   = false
         promptedVersion   = nil
-        BLOCK.blocked     = false
-        BLOCK.modal[0]    = false
         updaterStatus     = L'установлено ' .. fmtVer(dlVer or remoteVersion)
         logAct('Update installed: ' .. fmtVer(dlVer or remoteVersion) .. ' -> ' .. tostring(dest))
         notify(L'Обновление установлено - перезапуск...', 0x00FF00)
@@ -1008,10 +978,7 @@ local function startUpdateCheck()
     lastAutoCheck = os.time()
     lua_thread.create(function()
         wait(AUTO_CHECK_DELAY * 1000)
-        if isSampAvailable() then
-            checkBlockedVersions(true)
-            doCheck(true)
-        end
+        if isSampAvailable() then doCheck(true) end
     end)
 end
 
@@ -1038,44 +1005,38 @@ end
 -- ============================================================
 --  УТИЛИТЫ И ОТЧЁТЫ
 -- ============================================================
-local function parseMoney(s)
-    if not s then return 0 end
-    local raw = s:match('%$(%d[%d%.,]*)') or s:match('(%d[%d%.,]*)%$')
-    if not raw then return 0 end
-    raw = raw:gsub('[%.,]', '')
-    return tonumber(raw) or 0
-end
-
 local function stripColors(t)
     if not t then return '' end
     return (t:gsub('{%x%x%x%x%x%x}', ''):gsub('{%x%x%x%x%x%x%x%x}', ''))
 end
 
 local ZP_JOB_LIST = {
-    { key = 'taxi',      label = L'Такси',               icon = 'taxi'      },
-    { key = 'trucker',   label = L'Дальнобойщик',        icon = 'trucker'   },
-    { key = 'collector', label = L'Инкассатор',          icon = 'collector' },
-    { key = 'deliverer', label = L'Развозчик продуктов', icon = 'deliverer' },
-    { key = 'mechanic',  label = L'Механик',             icon = 'mechanic'  },
-    { key = 'bus',       label = L'Водитель автобуса',   icon = 'bus'       },
-    { key = 'garbage',   label = L'Мусорщик',            icon = 'garbage'   },
+    { key = 'taxi',       label = L'Такси',               icon = 'taxi'       },
+    { key = 'roadworker', label = L'Ремонтник дорог',     icon = 'roadworker' },
+    { key = 'trucker',    label = L'Дальнобойщик',        icon = 'trucker'    },
+    { key = 'collector',  label = L'Инкассатор',          icon = 'collector'  },
+    { key = 'deliverer',  label = L'Развозчик продуктов', icon = 'deliverer'  },
+    { key = 'mechanic',   label = L'Механик',             icon = 'mechanic'   },
+    { key = 'bus',        label = L'Водитель автобуса',   icon = 'bus'        },
+    { key = 'garbage',    label = L'Мусорщик',            icon = 'garbage'    },
 }
 local ZP_LABEL = {}
 for _, j in ipairs(ZP_JOB_LIST) do ZP_LABEL[j.key] = j.label end
 local ZP_DIALOG_ID = 8888
 
 local function zpTotal()
-    return ZP.taxi + ZP.trucker + ZP.collector + ZP.deliverer + ZP.mechanic + ZP.bus + ZP.garbage
+    return ZP.taxi + ZP.roadworker + ZP.trucker + ZP.collector
+         + ZP.deliverer + ZP.mechanic + ZP.bus + ZP.garbage
 end
 
 local function zpReportText()
     local lines = {
         L'Автоловля заказов:',
         string.format(L'  Заказов выполнено: %d', CFG.ordersDone),
-        string.format(L'  Заработано: $%s', zpFormatMoney(CFG.moneyEarned)),
         '',
         L'Выплаты по работам:',
         L'  Такси:             $' .. zpFormatMoney(ZP.taxi),
+        L'  Ремонтник дорог:   $' .. zpFormatMoney(ZP.roadworker),
         L'  Дальнобойщик:      $' .. zpFormatMoney(ZP.trucker),
         L'  Инкассатор:        $' .. zpFormatMoney(ZP.collector),
         L'  Развозчик:         $' .. zpFormatMoney(ZP.deliverer),
@@ -1093,33 +1054,357 @@ end
 local function resetAllStats()
     CFG.ordersDone  = 0
     CFG.moneyEarned = 0
-    ZP.taxi, ZP.trucker, ZP.collector, ZP.deliverer, ZP.mechanic, ZP.bus, ZP.garbage = 0, 0, 0, 0, 0, 0, 0
+    ZP.taxi, ZP.roadworker, ZP.trucker, ZP.collector = 0, 0, 0, 0
+    ZP.deliverer, ZP.mechanic, ZP.bus, ZP.garbage    = 0, 0, 0, 0
     statDispOrders  = 0
     statDispMoney   = 0
     statDispTotal   = 0
-    zpMovedDist     = 0.0
-    zpLastX, zpLastY, zpLastZ = nil, nil, nil
     markDirty()
     saveCfg()
 end
 
 -- ============================================================
---  СОСТОЯНИЕ
+--  СОСТОЯНИЕ АВТОЛОВЛИ И СМЕН (ACTIVE JOB STATE MACHINE)
 -- ============================================================
-local awaitingDialog        = false
-local awaitingExpire        = 0
-local lastTapTime           = -TAP_COOLDOWN * 1000
-local hasActiveOrder        = false
-local pendingAccept         = nil
-local tapSequenceActive     = false
-local tapSeqIndex           = 0
-local tapSeqNextSend        = 0
-local orderConfirmedByServer = false
-local lastAcceptedDialogId   = nil
+local awaitingDialog          = false
+local awaitingExpire          = 0
+local lastTapTime             = -CATCH.TAP_COOLDOWN * 1000
+local hasActiveOrder          = false
+local pendingAccept           = nil
+local pendingDialogReply      = nil
+local tapSequenceActive       = false
+local tapSeqIndex             = 0
+local tapSeqNextSend          = 0
+local orderConfirmedByServer  = false
+local lastAcceptedDialogId    = nil
 local lastAcceptedDialogStyle = nil
-local lastAcceptAt           = 0
+local lastAcceptAt            = 0
+local acceptConfirmExpire     = 0
+
+local JOB_STATE = {
+    activeJob           = nil,
+    jobStartedAt        = 0,
+    lastJobEventAt      = 0,
+    nonJobBlockUntil    = 0,
+    taxiErrorBlockUntil = 0,
+    lastOrderConfirmAt  = 0,
+    lastOrderCancelAt   = 0,
+    lastOrderErrorAt    = 0,
+    orderBurstAt        = 0,
+    orderBurstCount     = 0,
+    burstRetryUsed      = false,
+    firstCatchWarnShown = false,
+    taxiHudPayPendingAt = nil,
+    busShiftAccum       = 0,
+    roadShiftAccum      = 0,
+    lastJobHudPayAt     = {},
+    lastJobChatPayAt    = {},
+    pendingChatPayouts  = {},
+}
+
+local function setActiveJob(job, reason)
+    if job ~= 'taxi' and (hasActiveOrder or pendingAccept or tapSequenceActive or awaitingDialog or pendingDialogReply) then
+        hasActiveOrder          = false
+        pendingAccept           = nil
+        pendingDialogReply      = nil
+        awaitingDialog          = false
+        tapSequenceActive       = false
+        orderConfirmedByServer  = false
+        lastAcceptedDialogId    = nil
+        lastAcceptedDialogStyle = nil
+        lastAcceptAt            = 0
+        acceptConfirmExpire     = 0
+        JOB_STATE.taxiHudPayPendingAt = nil
+        logAct('Order state cleared on job change -> ' .. tostring(job or 'none') .. ' (' .. tostring(reason or '') .. ')')
+    end
+    if JOB_STATE.activeJob ~= job then
+        if job == 'bus' then JOB_STATE.busShiftAccum = 0 end
+        if job == 'roadworker' then JOB_STATE.roadShiftAccum = 0 end
+        JOB_STATE.activeJob = job
+        JOB_STATE.jobStartedAt = os.clock()
+        logAct('ActiveJob -> ' .. tostring(job or 'none') .. ' (' .. tostring(reason or '') .. ')')
+    end
+    JOB_STATE.lastJobEventAt = os.clock()
+end
+
+local function blockNonJob(seconds, reason)
+    local untilT = os.clock() + (seconds or 2.5)
+    if untilT > JOB_STATE.nonJobBlockUntil then
+        JOB_STATE.nonJobBlockUntil = untilT
+        logAct('NonJob guard ' .. string.format('%.1fs', seconds or 2.5) .. ': ' .. tostring(reason))
+    end
+end
+
+local function creditJobPayout(job, amount, sourceTag, silentToast)
+    if not job or not ZP[job] or not amount or amount <= 0 then return end
+    ZP[job] = ZP[job] + amount
+    if job == 'taxi' then
+        CFG.moneyEarned = CFG.moneyEarned + amount
+    elseif job == 'bus' then
+        JOB_STATE.busShiftAccum = JOB_STATE.busShiftAccum + amount
+    elseif job == 'roadworker' then
+        JOB_STATE.roadShiftAccum = JOB_STATE.roadShiftAccum + amount
+    end
+    markDirty()
+    logAct(string.format('Payout[%s] %s +%d (total %d)',
+        tostring(sourceTag or 'log'), job, math.floor(amount), math.floor(ZP[job])))
+    if not silentToast then
+        notify(L'ЗП ' .. ZP_LABEL[job] .. ': +$' .. zpFormatMoney(amount) ..
+            L' | Всего: $' .. zpFormatMoney(ZP[job]), 0x00FF00)
+    end
+end
+
+-- ============================================================
+--  NEOMLOADER LOG TAILER (ОБЛЕГЧЁННЫЙ PACKET 220 + DIALOGTRACKER)
+-- ============================================================
+local NEOM_POLL_INTERVAL = 0.45   -- бережный опрос (~2 раза/сек, без фризов на Android)
+local NEOM_CHUNK_BYTES   = 49152  -- ограниченный размер чтения за кадр (48 КБ)
+local MAX_SINGLE_JOB_PAY = 50000000
+
+local NEOM = {
+    path           = nil,
+    found          = false,
+    offset         = 0,
+    partial        = '',
+    lastPoll       = 0,
+    lastHudBalance = nil,
+    hasInitBalance = false,
+    lastDelta      = 0,
+    lastDeltaAt    = 0,
+    packetsRead    = 0,
+    nextRescanAt   = 0,
+    warnedMissing  = false,
+}
+
+local function findNeomLogPath()
+    local workClean = tostring(WORK_DIR or ''):gsub('/+$', '')
+    local parentDir = workClean:match('^(.+)/[^/]+$')
+    local candidates = {
+        workClean .. '/neomloader.log',
+        workClean .. '/logs/neomloader.log',
+        parentDir and (parentDir .. '/neomloader.log') or nil,
+        workClean .. '/monetloader.log',
+        parentDir and (parentDir .. '/monetloader.log') or nil,
+        '/sdcard/Android/media/com.arizona21.game.web/neomloader/neomloader.log',
+        '/storage/emulated/0/Android/media/com.arizona21.game.web/neomloader/neomloader.log',
+        '/sdcard/Android/media/com.arizona.game/neomloader/neomloader.log',
+        '/sdcard/Android/media/com.arizona21.game/neomloader/neomloader.log',
+        '/sdcard/Android/media/com.arizona21.game.web/monetloader/monetloader.log',
+        '/sdcard/Android/media/com.arizona.game/monetloader/monetloader.log',
+    }
+    for _, p in ipairs(candidates) do
+        if p then
+            local f = io.open(p, 'rb')
+            if f then
+                f:close()
+                return p
+            end
+        end
+    end
+    return nil
+end
+
+local function initNeomTailer()
+    local p = findNeomLogPath()
+    if not p then
+        NEOM.path  = nil
+        NEOM.found = false
+        if not NEOM.warnedMissing then
+            NEOM.warnedMissing = true
+            logAct('NeomLog not found (WORK_DIR=' .. tostring(WORK_DIR) .. ')')
+        end
+        return false
+    end
+    NEOM.path  = p
+    NEOM.found = true
+
+    local f = io.open(p, 'rb')
+    if not f then
+        NEOM.found = false
+        return false
+    end
+    local size = f:seek('end') or 0
+    if size > 0 then
+        local tailStart = math.max(0, size - 32768)
+        f:seek('set', tailStart)
+        local tailChunk = f:read('*a') or ''
+        local lastRaw = nil
+        for rawStr in tailChunk:gmatch("%[Money%] Intercepted Packet 220 HUD balance: %$%-?%d+ %(raw='(%-?%d+)'%)") do
+            lastRaw = rawStr
+        end
+        if lastRaw then
+            local b = tonumber(lastRaw)
+            if b then
+                NEOM.lastHudBalance = b
+                NEOM.hasInitBalance = true
+            end
+        end
+    end
+    f:close()
+
+    NEOM.offset  = size
+    NEOM.partial = ''
+    logAct('NeomLog connected: ' .. p .. ' (offset=' .. size
+        .. ', initBal=' .. tostring(NEOM.lastHudBalance or 'wait') .. ')')
+    return true
+end
+
+local function onHudBalanceIncrease(delta)
+    local now = os.clock()
+    NEOM.lastDelta   = delta
+    NEOM.lastDeltaAt = now
+
+    if delta > MAX_SINGLE_JOB_PAY then
+        logAct(string.format('Packet220 +%d skipped (>MAX_SINGLE_JOB_PAY)', delta))
+        return
+    end
+
+    if now < JOB_STATE.nonJobBlockUntil then
+        logAct(string.format('Packet220 +%d blocked by NonJob guard', delta))
+        return
+    end
+
+    local job = JOB_STATE.activeJob
+    if not job then
+        logAct(string.format('Packet220 +%d ignored (no activeJob)', delta))
+        return
+    end
+
+    -- Защита от дублирования: если этот платёж только что засчитан chat-fallback
+    local chatAt = JOB_STATE.lastJobChatPayAt[job] or 0
+    if (now - chatAt) < 4.0 then
+        logAct(string.format('Packet220 +%d skipped for %s (already counted by chat)', delta, job))
+        return
+    end
+
+    -- Если в очереди есть отложенный chat-fallback для этой работы — отменяем его (Packet 220 точнее)
+    for i = #JOB_STATE.pendingChatPayouts, 1, -1 do
+        if JOB_STATE.pendingChatPayouts[i].job == job then
+            table.remove(JOB_STATE.pendingChatPayouts, i)
+        end
+    end
+
+    JOB_STATE.lastJobHudPayAt[job] = now
+
+    if job == 'taxi' and hasActiveOrder and orderConfirmedByServer
+       and (now - JOB_STATE.lastOrderConfirmAt) > 3.0 and delta >= 1000 then
+        if not JOB_STATE.taxiHudPayPendingAt then
+            JOB_STATE.taxiHudPayPendingAt = now
+        end
+    end
+
+    local isFrequentTick = ((job == 'bus' or job == 'roadworker') and delta < 100000)
+    creditJobPayout(job, delta, 'Packet220', isFrequentTick)
+end
+
+local function processNeomLogLine(line)
+    if not line or line == '' then return end
+    -- Быстрая фильтрация: отсекаем 99% строк BulletTracer/скриптов без тяжёлых regex
+    local hasMoney = line:find('[Money]', 1, true) ~= nil
+    local hasDlg   = not hasMoney and (line:find('[DialogTracker]', 1, true) ~= nil)
+    if not hasMoney and not hasDlg then return end
+    if line:find('(script)', 1, true) then return end
+
+    if hasMoney then
+        local rawStr = line:match("%[Money%] Intercepted Packet 220 HUD balance: %$%-?%d+ %(raw='(%-?%d+)'%)")
+        if rawStr then
+            local val = tonumber(rawStr)
+            if val then
+                if not NEOM.hasInitBalance then
+                    NEOM.lastHudBalance = val
+                    NEOM.hasInitBalance = true
+                    logAct('Packet220 baseline set: $' .. zpFormatMoney(val))
+                else
+                    local delta = val - NEOM.lastHudBalance
+                    NEOM.lastHudBalance = val
+                    NEOM.packetsRead = NEOM.packetsRead + 1
+                    if delta > 0 then
+                        onHudBalanceIncrease(delta)
+                    elseif delta < 0 then
+                        logAct(string.format('Packet220 expense: %d', delta))
+                    end
+                end
+            end
+        end
+        return
+    end
+
+    local dlgId = line:match("%[DialogTracker%] Incoming ShowDialog RPC: id=(%d+)")
+    if dlgId then
+        local idNum = tonumber(dlgId)
+        if idNum == 27650 then setActiveJob('roadworker', 'DialogTracker#27650')
+        elseif idNum == 26920 or idNum == 15324 then setActiveJob('taxi', 'DialogTracker#' .. idNum)
+        elseif idNum == 15558 or idNum == 15507 then setActiveJob('trucker', 'DialogTracker#' .. idNum)
+        elseif idNum == 282 or idNum == 283 then setActiveJob('bus', 'DialogTracker#' .. idNum)
+        elseif idNum == 27384 or idNum == 27379 then setActiveJob('deliverer', 'DialogTracker#' .. idNum)
+        elseif idNum == 26815 or idNum == 26237 or idNum == 661 then setActiveJob('mechanic', 'DialogTracker#' .. idNum)
+        end
+    end
+end
+
+local function pollNeomLog(now)
+    if not CFG.useLogTracker then return end
+    if (now - NEOM.lastPoll) < NEOM_POLL_INTERVAL then return end
+    NEOM.lastPoll = now
+
+    if not NEOM.found or not NEOM.path then
+        if now >= NEOM.nextRescanAt then
+            NEOM.nextRescanAt = now + 5.0
+            initNeomTailer()
+        end
+        return
+    end
+
+    local f = io.open(NEOM.path, 'rb')
+    if not f then
+        NEOM.found = false
+        NEOM.nextRescanAt = now + 5.0
+        return
+    end
+
+    local size = f:seek('end') or 0
+    if size < NEOM.offset then
+        NEOM.offset  = 0
+        NEOM.partial = ''
+        NEOM.hasInitBalance = false
+        logAct('NeomLog truncated/rotated, offset reset to 0')
+    end
+
+    if size == NEOM.offset then
+        f:close()
+        return
+    end
+
+    -- Если накопилось > 512 КБ (например, из-за спама пакетов в фоне), перескакиваем ближе к хвосту чтобы не вешать FPS
+    local backlog = size - NEOM.offset
+    if backlog > 524288 then
+        NEOM.offset  = size - 65536
+        NEOM.partial = ''
+        logAct(string.format('NeomLog fast-forward (%d bytes backlog)', backlog))
+    end
+
+    f:seek('set', NEOM.offset)
+    local toRead = math.min(NEOM_CHUNK_BYTES, size - NEOM.offset)
+    local chunk = f:read(toRead) or ''
+    NEOM.offset = NEOM.offset + #chunk
+    f:close()
+
+    if chunk == '' then return end
+    local buf = NEOM.partial .. chunk
+    local pos = 1
+    while true do
+        local nl = buf:find('\n', pos, true)
+        if not nl then break end
+        local line = buf:sub(pos, nl - 1):gsub('\r$', '')
+        processNeomLogLine(line)
+        pos = nl + 1
+    end
+    NEOM.partial = buf:sub(pos)
+end
 
 local function finishOrder(reason, count)
+    pendingDialogReply = nil
+    JOB_STATE.taxiHudPayPendingAt = nil
     if count == false then
         if not hasActiveOrder and not pendingAccept and not awaitingDialog and not tapSequenceActive then
             if reason == 'manual' then
@@ -1127,26 +1412,28 @@ local function finishOrder(reason, count)
             end
             return
         end
-        hasActiveOrder         = false
-        pendingAccept          = nil
-        awaitingDialog         = false
-        tapSequenceActive      = false
-        orderConfirmedByServer = false
-        lastAcceptedDialogId   = nil
+        hasActiveOrder          = false
+        pendingAccept           = nil
+        awaitingDialog          = false
+        tapSequenceActive       = false
+        orderConfirmedByServer  = false
+        lastAcceptedDialogId    = nil
         lastAcceptedDialogStyle = nil
-        lastAcceptAt           = 0
+        lastAcceptAt            = 0
+        acceptConfirmExpire     = 0
         logAct('Order reset (not counted): ' .. tostring(reason))
         notify(L'Заказ сброшен: ' .. tostring(reason), 0xFFAA00)
     else
         if not hasActiveOrder then return end
-        hasActiveOrder         = false
-        pendingAccept          = nil
-        awaitingDialog         = false
-        tapSequenceActive      = false
-        orderConfirmedByServer = false
-        lastAcceptedDialogId   = nil
+        hasActiveOrder          = false
+        pendingAccept           = nil
+        awaitingDialog          = false
+        tapSequenceActive       = false
+        orderConfirmedByServer  = false
+        lastAcceptedDialogId    = nil
         lastAcceptedDialogStyle = nil
-        lastAcceptAt           = 0
+        lastAcceptAt            = 0
+        acceptConfirmExpire     = 0
         CFG.ordersDone = CFG.ordersDone + 1
         markDirty()
         logAct('Order done: ' .. tostring(reason))
@@ -1157,11 +1444,14 @@ end
 local function resetCatchCycle(reason)
     tapSequenceActive = false
     awaitingDialog    = false
+    if reason == 'cancelled/taken' or reason == 'dialog error cancel' then
+        lastTapTime = (os.clock() * 1000) - CATCH.TAP_COOLDOWN
+    end
     logAct('Reset cycle: ' .. tostring(reason))
 end
 
 -- ============================================================
---  СОБЫТИЯ ЧАТА
+--  СОБЫТИЯ ЧАТА (КОНТЕКСТ СМЕН + PAYDAY + FALLBACK)
 -- ============================================================
 local SERVER_TAG_PREFIXES = {
     'system', 'server', 'admin', 'event', 'info',
@@ -1199,6 +1489,70 @@ local function isPlayerMessage(text)
     return false
 end
 
+local function isPayDayLine(cleanN)
+    return cleanN:find(L'банковский чек', 1, true)
+        or cleanN:find(L'текущая сумма в банке', 1, true)
+        or cleanN:find(L'текущая сумма на депозите', 1, true)
+        or cleanN:find(L'общая заработная плата', 1, true)
+        or cleanN:find(L'дивидентный договор', 1, true)
+        or cleanN:find(L'баланс на донат-счет', 1, true)
+        or cleanN:find(L'премия за работу таксистом', 1, true)
+        or cleanN:find(L'чаевых таксиста', 1, true)
+end
+
+local function updateJobContextFromChat(cleanN)
+    -- Переключение активной работы по явным системным сообщениям
+    if cleanN:find(L'вы начали работу таксистом', 1, true) then
+        setActiveJob('taxi', 'chat-start'); return
+    end
+    if cleanN:find(L'вы начали работу ремонтника дорог', 1, true) then
+        setActiveJob('roadworker', 'chat-start'); return
+    end
+    if cleanN:find(L'база дальнобойщиков', 1, true)
+       or cleanN:find(L'вы получили транспорт на базе', 1, true)
+       or cleanN:find(L'вы подцепили груз', 1, true) then
+        setActiveJob('trucker', 'chat-start'); return
+    end
+    if cleanN:find(L'вы начали работу инкассатором', 1, true)
+       or cleanN:find(L'назначенный для разгрузки', 1, true) then
+        setActiveJob('collector', 'chat-start'); return
+    end
+    if cleanN:find(L'работа водителя автобуса', 1, true)
+       or cleanN:find(L'водитель автобуса', 1, true) and cleanN:find(L'начал', 1, true) then
+        setActiveJob('bus', 'chat-start'); return
+    end
+    if cleanN:find(L'[развозчик продуктов]', 1, true) then
+        setActiveJob('deliverer', 'chat-msg'); return
+    end
+    if cleanN:find(L'наполненой мусорки', 1, true)
+       or cleanN:find(L'наполненной мусорки', 1, true)
+       or cleanN:find(L'установите мусорный бак', 1, true)
+       or cleanN:find(L'мусоровоз', 1, true)
+       or cleanN:find(L'всего мусора:', 1, true) then
+        setActiveJob('garbage', 'chat-start'); return
+    end
+    if cleanN:find(L'прицепили автомобиль к эвакуатору', 1, true)
+       or (cleanN:find(L'[диспетчер]', 1, true) and cleanN:find(L'механик', 1, true)) then
+        setActiveJob('mechanic', 'chat-start'); return
+    end
+
+    -- Защита от нерабочих денежных событий (банк, трейд, рынок, рулетка, PayDay)
+    if cleanN:find(L'вы сняли со счета', 1, true)
+       or cleanN:find(L'сняли с банковского счета', 1, true)
+       or cleanN:find(L'перевел вам', 1, true)
+       or cleanN:find(L'перевод от', 1, true)
+       or cleanN:find(L'вы продали', 1, true)
+       or cleanN:find(L'купил у вас', 1, true)
+       or cleanN:find(L'трейд успешно', 1, true)
+       or cleanN:find(L'обмен завершен', 1, true)
+       or cleanN:find(L'ваш приз:', 1, true)
+       or cleanN:find(L'вы выиграли', 1, true)
+       or cleanN:find(L'промокод', 1, true)
+       or isPayDayLine(cleanN) then
+        blockNonJob(isPayDayLine(cleanN) and 3.5 or 2.5, 'chat-nonjob')
+    end
+end
+
 function sampev.onServerMessage(color, text)
     local isPlayer = isPlayerMessage(text)
     local cleanRaw = stripColors(text)
@@ -1209,44 +1563,169 @@ function sampev.onServerMessage(color, text)
     -- При перезаходе / спавне добавляем новую секцию в лог
     if not isPlayer and (cleanN:find(L'добро пожаловать на arizona', 1, true)
        or cleanN:find(L'вы выбрали местом спавна', 1, true)) then
-        logInit('Реконнект / Вход в игру')
+        logInit(L'Реконнект / Вход в игру')
+        setActiveJob(nil, 'reconnect')
     end
 
-    if not isPlayer and zpIsPayout(cleanN) then
-        local amount = zpExtractMoney(stripColors(text))
-        local job    = zpDetectJob(cleanN)
+    if not isPlayer then
+        updateJobContextFromChat(cleanN)
+    end
+
+    local neomActive = CFG.useLogTracker and NEOM.found and NEOM.hasInitBalance
+    local now = os.clock()
+
+    -- Сводки конца смены автобусника / ремонтника (включая $0)
+    if not isPlayer and cleanN:find(L'рабочий день завершен', 1, true) then
+        local amount = zpExtractMoney(cleanRaw)
+        local hudAt = JOB_STATE.lastJobHudPayAt['bus'] or 0
+        local recentlyCountedByLog = neomActive and ((now - hudAt) < 8.0)
+        if neomActive and JOB_STATE.busShiftAccum > 0 then
+            notify(L'Смена автобуса завершена: +$' .. zpFormatMoney(JOB_STATE.busShiftAccum)
+                .. L' | Всего: $' .. zpFormatMoney(ZP.bus), 0x00FF00)
+        elseif amount and amount > 0 and not recentlyCountedByLog then
+            creditJobPayout('bus', amount, 'chat-fallback', false)
+            JOB_STATE.lastJobChatPayAt['bus'] = now
+        end
+        JOB_STATE.busShiftAccum = 0
+        setActiveJob(nil, 'bus-shift-end')
+    elseif not isPlayer and cleanN:find(L'завершили работу ремонтника дорог', 1, true) then
+        local amount = zpExtractMoney(cleanRaw)
+        local hudAt = JOB_STATE.lastJobHudPayAt['roadworker'] or 0
+        local recentlyCountedByLog = neomActive and ((now - hudAt) < 8.0)
+        if neomActive and JOB_STATE.roadShiftAccum > 0 then
+            notify(L'Смена ремонтника дорог: +$' .. zpFormatMoney(JOB_STATE.roadShiftAccum)
+                .. L' | Всего: $' .. zpFormatMoney(ZP.roadworker), 0x00FF00)
+        elseif amount and amount > 0 and not recentlyCountedByLog then
+            creditJobPayout('roadworker', amount, 'chat-fallback', false)
+            JOB_STATE.lastJobChatPayAt['roadworker'] = now
+        end
+        JOB_STATE.roadShiftAccum = 0
+        setActiveJob(nil, 'roadworker-shift-end')
+    elseif not isPlayer and not isPayDayLine(cleanN) and zpIsPayout(cleanN) then
+        -- Разовые выплаты всех работ (без PayDay и чаевых; без дублирования Packet 220)
+        local amount = zpExtractMoney(cleanRaw)
+        local job    = zpDetectJob(cleanN) or JOB_STATE.activeJob
         if amount and job then
-            ZP[job] = ZP[job] + amount
-            zpMovedDist = 0.0
-            markDirty()
-            logAct(string.format('Payout %s +%d (total %d)', job, amount, ZP[job]))
-            notify(L'ЗП ' .. ZP_LABEL[job] .. ': +$' .. zpFormatMoney(amount) ..
-                L' | Всего: $' .. zpFormatMoney(ZP[job]), 0x00FF00)
+            local hudAt = JOB_STATE.lastJobHudPayAt[job] or 0
+            local recentlyCountedByLog = neomActive and ((now - hudAt) < 8.0)
+            if recentlyCountedByLog then
+                logAct(string.format('Chat payout skipped (already counted via Packet220): %s +%d', job, amount))
+            elseif neomActive then
+                -- Packet 220 часто приходит в neomloader.log на 0.4с позже чата; ждём до 1.8с перед fallback
+                JOB_STATE.pendingChatPayouts[#JOB_STATE.pendingChatPayouts + 1] = {
+                    job = job,
+                    amount = amount,
+                    fireAt = now + 1.8,
+                }
+            else
+                creditJobPayout(job, amount, 'chat-fallback', false)
+                JOB_STATE.lastJobChatPayAt[job] = now
+            end
         end
     end
 
-    if not isPlayer and cleanN:find(L'клиент оплатил', 1, true) then
-        local cash = parseMoney(stripColors(text))
-        if cash > 0 then
-            CFG.moneyEarned = CFG.moneyEarned + cash
-            markDirty()
-            logAct('Money +' .. cash .. ' (total ' .. CFG.moneyEarned .. ')')
-        end
+    -- Завершение смены / увольнение
+    if not isPlayer and (cleanN:find(L'работа водителя мусорщика завершена', 1, true)
+        or cleanN:find(L'вы закончили работу', 1, true)
+        or cleanN:find(L'вы завершили работу', 1, true)
+        or cleanN:find(L'рабочий день окончен', 1, true)
+        or cleanN:find(L'рабочий день завершен', 1, true)
+        or cleanN:find(L'смена завершена', 1, true)
+        or cleanN:find(L'вы уволились', 1, true)) then
+        setActiveJob(nil, 'chat-work-end')
     end
 
-    -- Если заказ отменили или забрали до того, как мы доехали
-    if not isPlayer and (cleanN:find(L'клиент отменил заказ', 1, true)
-        or cleanN:find(L'заказ уже принят', 1, true)
-        or cleanN:find(L'заказ недоступен', 1, true)
-        or cleanN:find(L'заказ отмен', 1, true)) then
-        if pendingAccept or hasActiveOrder or awaitingDialog then
-            logAct('Order cancelled or taken by another player')
-            hasActiveOrder         = false
-            pendingAccept          = nil
-            orderConfirmedByServer = false
-            lastAcceptedDialogId   = nil
+    -- Мгновенная остановка автоловли при ошибках такси (виртуальный мир, вне авто, не на смене и т.д.)
+    if not isPlayer and (cleanN:find(L'находясь в виртуальном мире', 1, true)
+        or cleanN:find(L'не можете работать в такси', 1, true)
+        or cleanN:find(L'вы не работаете таксистом', 1, true)
+        or cleanN:find(L'должны находиться в такси', 1, true)) then
+        JOB_STATE.taxiErrorBlockUntil = os.clock() + 5.0
+        if cleanN:find(L'вы не работаете таксистом', 1, true) then
+            setActiveJob(nil, 'not-taxi-driver')
+        end
+        if tapSequenceActive or awaitingDialog or pendingAccept or pendingDialogReply then
+            pendingAccept           = nil
+            pendingDialogReply      = nil
+            awaitingDialog          = false
+            tapSequenceActive       = false
+            orderConfirmedByServer  = false
+            acceptConfirmExpire     = 0
+            logAct('Taxi catch aborted by server error: ' .. cleanRaw)
+            notify(L'Ловля остановлена: недоступно в текущей зоне', 0xFFAA00)
+        end
+        return
+    end
+
+    if not isPlayer and (cleanN:find(L'у вас уже принят заказ', 1, true)
+        or cleanN:find(L'у вас уже есть активный заказ', 1, true)
+        or cleanN:find(L'уже выполняете заказ', 1, true)) then
+        if tapSequenceActive or awaitingDialog or pendingAccept then
+            tapSequenceActive = false
+            awaitingDialog    = false
+            pendingAccept     = nil
+            if JOB_STATE.activeJob == 'taxi' then
+                hasActiveOrder         = true
+                orderConfirmedByServer = true
+            end
+            logAct('Taxi catch stopped: order already active')
+        end
+        return
+    end
+
+    -- Если заказ такси отменили или забрали до того, как мы доехали
+    local isChatOrderCancel = (cleanN:find(L'клиент', 1, true) ~= nil and cleanN:find(L'отменил', 1, true) ~= nil and cleanN:find(L'заказ', 1, true) ~= nil)
+        or cleanN:find(L'отменил заказ', 1, true) ~= nil
+        or cleanN:find(L'заказ уже принят', 1, true) ~= nil
+        or cleanN:find(L'заказ недоступен', 1, true) ~= nil
+        or cleanN:find(L'заказ не найден', 1, true) ~= nil
+        or cleanN:find(L'заказ отмен', 1, true) ~= nil
+        or cleanN:find(L'заказ больше не', 1, true) ~= nil
+    if not isPlayer and isChatOrderCancel then
+        if pendingAccept or hasActiveOrder or awaitingDialog or tapSequenceActive or pendingDialogReply then
+            local wasConfirmed = orderConfirmedByServer
+            hasActiveOrder          = false
+            pendingAccept           = nil
+            pendingDialogReply      = nil
+            orderConfirmedByServer  = false
+            lastAcceptedDialogId    = nil
             lastAcceptedDialogStyle = nil
-            lastAcceptAt           = 0
+            lastAcceptAt            = 0
+            acceptConfirmExpire     = 0
+            JOB_STATE.taxiHudPayPendingAt = nil
+
+            local canBurstRetry = CFG.catchEnabled and (not wasConfirmed)
+                and (not JOB_STATE.burstRetryUsed)
+                and (JOB_STATE.orderBurstCount > 1)
+                and ((now - JOB_STATE.orderBurstAt) <= 2.5)
+                and (now >= JOB_STATE.taxiErrorBlockUntil)
+
+            if canBurstRetry then
+                JOB_STATE.burstRetryUsed   = true
+                JOB_STATE.lastOrderErrorAt = now
+                lastTapTime             = now * 1000
+                awaitingDialog          = true
+                awaitingExpire          = now + 5.0
+                tapSequenceActive       = true
+                pendingAccept           = now
+                if CFG.turboCatch then
+                    sendTapPacketWithIndex(0)
+                    tapSeqIndex    = 1
+                    tapSeqNextSend = now + (CATCH.TAP_STEP_TURBO / 1000)
+                    logAct('Burst retry (TURBO 0ms) on next order in batch')
+                else
+                    local reactMs = humanDelayMs(CATCH.REACT_DELAY_MIN, CATCH.REACT_DELAY_MAX)
+                    tapSeqIndex    = 0
+                    tapSeqNextSend = now + (reactMs / 1000)
+                    logAct(string.format('Burst retry (#2 of %d, react=%dms)', JOB_STATE.orderBurstCount, reactMs))
+                end
+                if type(sampSetCurrentDialogId) == 'function' then sampSetCurrentDialogId(-1) end
+                return
+            end
+
+            logAct('Order cancelled or taken by another player')
+            JOB_STATE.lastOrderCancelAt = now
+            if not wasConfirmed then JOB_STATE.lastOrderErrorAt = now end
             resetCatchCycle('cancelled/taken')
             notify(L'Заказ отменен/перехвачен, жду новый...', 0xFFAA00)
             if type(sampSetCurrentDialogId) == 'function' then sampSetCurrentDialogId(-1) end
@@ -1254,24 +1733,32 @@ function sampev.onServerMessage(color, text)
         end
     end
 
-    if not isPlayer and (cleanN:find(L'бонус таксиста', 1, true)
-       or cleanN:find(L'метка на карте', 1, true)
+    -- Подтверждение заказа ТАКСИ (изолировано от вызовов механика!)
+    local isTaxiContext = (JOB_STATE.activeJob == 'taxi' or JOB_STATE.activeJob == nil
+        or pendingAccept ~= nil or tapSequenceActive or awaitingDialog)
+    if not isPlayer and isTaxiContext and (
+          cleanN:find(L'бонус таксиста', 1, true)
        or cleanN:find(L'отправился к клиенту', 1, true)
        or cleanN:find(L'вы приняли заказ', 1, true)
-       or cleanN:find(L'вы приняли вызов', 1, true)) then
-        hasActiveOrder         = true
-        orderConfirmedByServer = true
-        pendingAccept          = nil
-        awaitingDialog         = false
-        tapSequenceActive      = false
+       or (cleanN:find(L'вы приняли вызов', 1, true) and JOB_STATE.activeJob ~= 'mechanic')) then
+        setActiveJob('taxi', 'order-confirmed')
+        hasActiveOrder                = true
+        orderConfirmedByServer        = true
+        JOB_STATE.lastOrderConfirmAt  = os.clock()
+        JOB_STATE.taxiHudPayPendingAt = nil
+        pendingAccept                 = nil
+        awaitingDialog                = false
+        tapSequenceActive             = false
+        acceptConfirmExpire           = 0
         logAct('Order confirmed by server message')
         notify(L'Заказ принят! Метка на карте', 0x00FF00)
         return
     end
 
-    if hasActiveOrder and not isPlayer then
+    if hasActiveOrder and not isPlayer and not isPayDayLine(cleanN) then
         if cleanN:find(L'вы доставили клиента', 1, true)
-           or cleanN:find(L'вы доставили клиента по имени', 1, true) then
+           or cleanN:find(L'вы доставили клиента по имени', 1, true)
+           or (cleanN:find(L'[такси]', 1, true) and cleanN:find(L'клиент оплатил', 1, true)) then
             finishOrder(L'доставлен'); return
         end
         if cleanN:find(L'спасибо', 1, true) and cleanN:find(L'подкинул', 1, true) then
@@ -1282,45 +1769,77 @@ function sampev.onServerMessage(color, text)
            or cleanN:find(L'поездка завершена', 1, true) then
             finishOrder(L'клиент вышел'); return
         end
-        local cashRaw = cleanRaw:match('%+%s*(%d[%d%.,]*)%$') or cleanRaw:match('%+%s*%$(%d[%d%.,]*)')
-        if cashRaw then
-            local cash = tonumber((cashRaw:gsub('[%.,]', ''))) or 0
-            finishOrder('+' .. cash .. '$'); return
-        end
         if cleanN:find(L'вы прервали заказ', 1, true)
            or cleanN:find(L'вы закончили работу', 1, true) then
             finishOrder(L'прерван/закончен', false); return
         end
     end
 
+    local isExplicitTaxiMsg = cleanN:find(L'[такси]', 1, true) ~= nil
+    local isOrderChatLine = false
+    if CFG.catchEnabled and not isPlayer and not hasActiveOrder
+       and (isExplicitTaxiMsg or JOB_STATE.activeJob == 'taxi') then
+        for _, pat in ipairs(ORDER_PATTERNS) do
+            if cleanN:find(pat, 1, true) then isOrderChatLine = true; break end
+        end
+        if isOrderChatLine then
+            if (now - JOB_STATE.orderBurstAt) <= 1.2 then
+                JOB_STATE.orderBurstCount = JOB_STATE.orderBurstCount + 1
+            else
+                JOB_STATE.orderBurstCount = 1
+                JOB_STATE.orderBurstAt    = now
+                JOB_STATE.burstRetryUsed  = false
+            end
+        end
+    end
+
     if CFG.catchEnabled
-       and not BLOCK.blocked
        and not isPlayer
        and not hasActiveOrder
        and not tapSequenceActive
        and not awaitingDialog
-       and not pendingAccept then
-        local matched = false
-        for _, pat in ipairs(ORDER_PATTERNS) do
-            if cleanN:find(pat, 1, true) then matched = true; break end
+       and not pendingAccept
+       and os.clock() >= JOB_STATE.taxiErrorBlockUntil
+       and (isExplicitTaxiMsg or JOB_STATE.activeJob == nil or JOB_STATE.activeJob == 'taxi') then
+        local matched = isOrderChatLine
+        if not matched and (isExplicitTaxiMsg or JOB_STATE.activeJob == 'taxi') then
+            for _, pat in ipairs(ORDER_PATTERNS) do
+                if cleanN:find(pat, 1, true) then matched = true; break end
+            end
         end
         if matched then
-            if (os.clock() * 1000) < lastTapTime + TAP_COOLDOWN then return end
-            lastTapTime            = os.clock() * 1000
-            awaitingDialog         = true
-            awaitingExpire         = os.clock() + 6
-            tapSequenceActive      = true
-            tapSeqIndex            = 1
-            pendingAccept          = os.clock()
-            orderConfirmedByServer = false
-            lastAcceptedDialogId   = nil
+            local inInterior = (type(getActiveInterior) == 'function') and (getActiveInterior() ~= 0)
+            if inInterior then
+                logAct('New order skipped: player in interior')
+                return
+            end
+            if (os.clock() * 1000) < lastTapTime + CATCH.TAP_COOLDOWN then return end
+            lastTapTime             = os.clock() * 1000
+            awaitingDialog          = true
+            awaitingExpire          = os.clock() + 7.5
+            tapSequenceActive       = true
+            pendingAccept           = os.clock()
+            orderConfirmedByServer  = false
+            lastAcceptedDialogId    = nil
             lastAcceptedDialogStyle = nil
-            lastAcceptAt           = 0
-            sendTapPacketWithIndex(0)
-            local stepMs = CFG.turboCatch and 0 or math.max(10, TAP_STEP_MS + math.random(-5, 15))
-            tapSeqNextSend         = os.clock() + (stepMs / 1000)
-            logAct('New order (chat) - queue scanning')
-            notify(L'Новый заказ, ловлю (чат)...', 0x00CCB3)
+            lastAcceptAt            = 0
+            acceptConfirmExpire     = 0
+            if isExplicitTaxiMsg then setActiveJob('taxi', 'taxi-order-msg') end
+
+            if CFG.turboCatch then
+                sendTapPacketWithIndex(0)
+                tapSeqIndex    = 1
+                tapSeqNextSend = os.clock() + (CATCH.TAP_STEP_TURBO / 1000)
+                logAct('New order (TURBO 0ms) - targeted tap #1')
+                notify(L'Новый заказ, ловлю (Турбо 0мс)...', 0x00CCB3)
+            else
+                -- В обычном режиме делаем быструю живую паузу реакции перед 1-м тапом
+                local reactMs = humanDelayMs(CATCH.REACT_DELAY_MIN, CATCH.REACT_DELAY_MAX)
+                tapSeqIndex    = 0
+                tapSeqNextSend = os.clock() + (reactMs / 1000)
+                logAct(string.format('New order (human react=%dms) - waiting', reactMs))
+                notify(L'Новый заказ, ловлю (' .. reactMs .. L' мс)...', 0x00CCB3)
+            end
         end
     end
 end
@@ -1328,31 +1847,31 @@ end
 -- ============================================================
 --  СОБЫТИЯ ДИАЛОГОВ
 -- ============================================================
-local function sendAcceptDialogNow(id, style, isTwoStepConfirm)
-    local delayMs = CFG.turboCatch and 0 or math.random(ACCEPT_DELAY_MIN, ACCEPT_DELAY_MAX)
-    local function execute()
-        sampSendDialogResponse(id, 1, 0, '')
-        if type(sampGetCurrentDialogId) == 'function' and type(sampSetCurrentDialogId) == 'function' then
-            local okId, curId = pcall(sampGetCurrentDialogId)
-            if okId and curId == id then sampSetCurrentDialogId(-1) end
-        end
-        notify(L'Авто-приём заказа', 0x00FF00)
-        logAct(string.format('Auto-accept id=%s style=%s delay=%dms (%s)',
-            tostring(id), tostring(style), delayMs,
-            isTwoStepConfirm and 'confirm-step' or 'instant'))
+local function executeDialogAcceptNow(id, style, delayMs, isTwoStepConfirm)
+    sampSendDialogResponse(id, 1, 0, '')
+    if type(sampGetCurrentDialogId) == 'function' and type(sampSetCurrentDialogId) == 'function' then
+        local okId, curId = pcall(sampGetCurrentDialogId)
+        if okId and curId == id then sampSetCurrentDialogId(-1) end
     end
+    notify(CFG.turboCatch and L'Авто-приём (Турбо)' or (L'Авто-приём (' .. delayMs .. L' мс)'), 0x00FF00)
+    logAct(string.format('Auto-accept id=%s style=%s delay=%dms (%s)',
+        tostring(id), tostring(style), delayMs,
+        CFG.turboCatch and 'turbo-0ms' or (isTwoStepConfirm and 'human-confirm' or 'human-staggered')))
+end
 
+local function sendAcceptDialogNow(id, style, isTwoStepConfirm)
+    local delayMs = CFG.turboCatch and 0 or humanDelayMs(CATCH.ACCEPT_DELAY_MIN, CATCH.ACCEPT_DELAY_MAX)
     if delayMs > 0 then
-        lua_thread.create(function()
-            wait(delayMs)
-            if not hasActiveOrder or not CFG.catchEnabled then
-                logAct('Auto-accept aborted (cancelled during delay)')
-                return
-            end
-            execute()
-        end)
+        pendingDialogReply = {
+            id = id,
+            style = style,
+            delayMs = delayMs,
+            isTwoStepConfirm = isTwoStepConfirm,
+            sendAt = os.clock() + (delayMs / 1000),
+        }
     else
-        execute()
+        pendingDialogReply = nil
+        executeDialogAcceptNow(id, style, 0, isTwoStepConfirm)
     end
 end
 
@@ -1366,12 +1885,66 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
     local bodyN  = normalize(stripColors(text or ''))
     local b1N    = normalize(b1 or '')
 
-    local isPayment = bodyN:find(':cash:', 1, true)
-                   or bodyN:find(L'вознаграждение', 1, true)
+    -- Отслеживание контекста смены и нерабочих денежных диалогов
+    local idNum = tonumber(id)
+    if idNum == 27650 or titleN:find(L'ремонт дорог', 1, true) then
+        setActiveJob('roadworker', 'dialog-road')
+    elseif idNum == 26920 or idNum == 15324 then
+        setActiveJob('taxi', 'dialog-taxi#' .. tostring(idNum))
+    elseif idNum == 15558 or idNum == 15507 or titleN:find(L'выбор груза', 1, true) then
+        setActiveJob('trucker', 'dialog-trucker')
+    elseif idNum == 282 or idNum == 283 or titleN:find(L'автобус', 1, true) then
+        setActiveJob('bus', 'dialog-bus')
+    elseif idNum == 27384 or idNum == 27379 or titleN:find(L'развозчик продуктов', 1, true) then
+        setActiveJob('deliverer', 'dialog-deliverer')
+    elseif idNum == 26815 or idNum == 26237 or idNum == 661 or titleN:find(L'механик', 1, true) then
+        setActiveJob('mechanic', 'dialog-mechanic')
+    end
+
+    if titleN:find(L'банк', 1, true)
+       or titleN:find(L'банкомат', 1, true)
+       or titleN:find(L'перевод', 1, true)
+       or titleN:find(L'лавка', 1, true)
+       or titleN:find(L'продаж', 1, true)
+       or titleN:find(L'рынок', 1, true)
+       or titleN:find(L'аукцион', 1, true)
+       or titleN:find(L'обмен', 1, true)
+       or titleN:find(L'донат', 1, true)
+       or titleN:find(L'трейд', 1, true) then
+        blockNonJob(4.0, 'dialog:' .. tostring(id))
+    end
+
+    local isPayment = (idNum ~= 15324) and (
+        bodyN:find(':cash:', 1, true)
+        or bodyN:find(L'вознаграждение', 1, true)
+    )
     if isPayment then
         logAct('Payment dialog - NOT touched')
         return
     end
+
+    local isOtherJobDlgId = (
+        idNum == 27650 or idNum == 15558 or idNum == 15507
+        or idNum == 282 or idNum == 283 or idNum == 285
+        or idNum == 27384 or idNum == 27379
+        or idNum == 26815 or idNum == 26237 or idNum == 661
+        or idNum == 26593 or idNum == 26594 or idNum == 26254
+        or idNum == 26243 or idNum == 26244 or idNum == 26245 or idNum == 26246
+        or idNum == 27903 or idNum == 27252 or idNum == 26838 or idNum == 28276
+    )
+
+    local isOtherJobDlg = isOtherJobDlgId
+        or titleN:find(L'аренд', 1, true)
+        or titleN:find(L'груз', 1, true)
+        or titleN:find(L'дальнобой', 1, true)
+        or titleN:find(L'механик', 1, true)
+        or titleN:find(L'развозчик', 1, true)
+        or titleN:find(L'ремонт дорог', 1, true)
+        or titleN:find(L'автобус', 1, true)
+        or (titleN:find(L'подтверждение заказа', 1, true) and JOB_STATE.activeJob ~= 'taxi')
+        or bodyN:find(L'грузовик', 1, true)
+        or bodyN:find(L'арендовать', 1, true)
+        or bodyN:find(L'развозчик', 1, true)
 
     local hasOrderBody = bodyN:find(L'заказ', 1, true)
                       or bodyN:find(L'вызов', 1, true)
@@ -1386,27 +1959,40 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
                       or bodyN:find(normalize(L'пункт назначения:'), 1, true)
 
     local isConfirmTitle = titleN:find(L'подтверждение', 1, true)
-    local isPendingCatch = pendingAccept and (os.clock() - pendingAccept) < PENDING_TIMEOUT
+    local isPendingCatch = pendingAccept and (os.clock() - pendingAccept) < CATCH.PENDING_TIMEOUT
     local isTwoStepConfirm = hasActiveOrder and not orderConfirmedByServer and isConfirmTitle
+        and hasOrderBody
         and (os.clock() - lastAcceptAt) < 3.5
         and (id ~= lastAcceptedDialogId or lastAcceptedDialogStyle == 2 or lastAcceptedDialogStyle == 4 or lastAcceptedDialogStyle == 5)
 
-    local isOrderDialog = (isConfirmTitle and (hasOrderBody or isPendingCatch or isTwoStepConfirm))
-                       or (b1N:find(L'принять', 1, true) and hasOrderBody)
+    local allowGenericTaxiDlg = (JOB_STATE.activeJob == nil or JOB_STATE.activeJob == 'taxi')
+    local isOrderDialog = (not isOtherJobDlg) and (
+        idNum == 15324
+        or (allowGenericTaxiDlg and isConfirmTitle and hasOrderBody)
+        or (allowGenericTaxiDlg and b1N:find(L'принять', 1, true) and hasOrderBody)
+    )
 
-    if isOrderDialog and CFG.catchEnabled and not BLOCK.blocked then
-        if CFG.autoAccept and (isPendingCatch or isTwoStepConfirm) then
-            hasActiveOrder         = true
-            pendingAccept          = nil
-            awaitingDialog         = false
-            tapSequenceActive      = false
-            lastAcceptedDialogId   = id
-            lastAcceptedDialogStyle = style
-            lastAcceptAt           = os.clock()
+    if isOrderDialog and CFG.catchEnabled then
+        if CFG.autoAccept and (((isPendingCatch or idNum == 15324) and not hasActiveOrder) or isTwoStepConfirm) then
+            setActiveJob('taxi', 'taxi-auto-accept')
+            hasActiveOrder                = true
+            pendingAccept                 = nil
+            awaitingDialog                = false
+            tapSequenceActive             = false
+            lastAcceptedDialogId          = id
+            lastAcceptedDialogStyle       = style
+            lastAcceptAt                  = os.clock()
+            JOB_STATE.lastOrderConfirmAt  = os.clock()
+            JOB_STATE.taxiHudPayPendingAt = nil
+            acceptConfirmExpire           = os.clock() + 6.5
 
             sendAcceptDialogNow(id, style, isTwoStepConfirm)
             return false
-        elseif CFG.autoAccept and (hasActiveOrder or ((os.clock() * 1000) - lastTapTime) < (PENDING_TIMEOUT * 1000 + 3000)) then
+        elseif CFG.autoAccept and (pendingDialogReply ~= nil or (hasActiveOrder and not orderConfirmedByServer and (os.clock() - lastAcceptAt) < 2.5)) then
+            -- Повторный пакет ShowDialog#15324 от 2-го тапа в очереди: не шлём Закрыть(0), чтобы не убить текущий Принять(1)
+            logAct('Duplicate order dialog suppressed (accept pending)')
+            return false
+        elseif CFG.autoAccept and (hasActiveOrder or ((os.clock() * 1000) - lastTapTime) < (CATCH.PENDING_TIMEOUT * 1000 + 3000)) then
             logAct('Late order dialog - force closing...')
             sampSendDialogResponse(id, 0, 0, '')
             if type(sampGetCurrentDialogId) == 'function' and type(sampSetCurrentDialogId) == 'function' then
@@ -1421,26 +2007,63 @@ function sampev.onShowDialog(id, style, title, b1, b2, text)
         end
     end
 
+    if idNum == 0 and CFG.catchEnabled and JOB_STATE.lastOrderCancelAt > 0
+       and (os.clock() - JOB_STATE.lastOrderCancelAt) < 2.5
+       and titleN:find(L'информация', 1, true) then
+        JOB_STATE.lastOrderCancelAt = 0
+        sampSendDialogResponse(id, 1, 0, '')
+        if type(sampGetCurrentDialogId) == 'function' and type(sampSetCurrentDialogId) == 'function' then
+            local okId, curId = pcall(sampGetCurrentDialogId)
+            if okId and curId == id then sampSetCurrentDialogId(-1) end
+        end
+        logAct('Closed post-cancel info dialog')
+        return false
+    end
+
     local isOrderCancelled =
         bodyN:find(L'заказ уже принят', 1, true)
         or bodyN:find(L'заказ отмен', 1, true)
-        or bodyN:find(L'клиент отменил', 1, true)
+        or bodyN:find(L'отменил заказ', 1, true)
+        or bodyN:find(L'заказ недоступен', 1, true)
+        or bodyN:find(L'заказ не найден', 1, true)
+        or (bodyN:find(L'клиент', 1, true) and bodyN:find(L'отменил', 1, true))
 
     local isAlreadyInOrder =
         bodyN:find(L'нельзя принять заказ', 1, true)
         or bodyN:find(L'уже выполняете', 1, true)
 
+    if idNum == 0 and CFG.catchEnabled and JOB_STATE.lastOrderErrorAt > 0
+       and (os.clock() - JOB_STATE.lastOrderErrorAt) < 0.8
+       and (titleN:find(L'ошибка', 1, true) or bodyN:find(L'заказ', 1, true)) then
+        JOB_STATE.lastOrderErrorAt = 0
+        sampSendDialogResponse(id, 1, 0, '')
+        if type(sampGetCurrentDialogId) == 'function' and type(sampSetCurrentDialogId) == 'function' then
+            local okId, curId = pcall(sampGetCurrentDialogId)
+            if okId and curId == id then sampSetCurrentDialogId(-1) end
+        end
+        return false
+    end
+
     if (isOrderCancelled or isAlreadyInOrder)
        and CFG.catchEnabled
-       and (pendingAccept or tapSequenceActive or awaitingDialog or hasActiveOrder or ((os.clock() * 1000) - lastTapTime) < 6000) then
+       and (pendingAccept or tapSequenceActive or awaitingDialog or hasActiveOrder or pendingDialogReply or ((os.clock() * 1000) - lastTapTime) < 6000) then
         if isOrderCancelled then
-            hasActiveOrder         = false
-            pendingAccept          = nil
-            orderConfirmedByServer = false
-            lastAcceptedDialogId   = nil
+            pendingDialogReply      = nil
+            hasActiveOrder          = false
+            orderConfirmedByServer  = false
+            lastAcceptedDialogId    = nil
             lastAcceptedDialogStyle = nil
-            resetCatchCycle('dialog error cancel')
+            -- Если перебор очереди ещё идёт по первым слотам, даём шанс следующим индексам
+            if tapSequenceActive and tapSeqIndex <= 4 then
+                pendingAccept  = os.clock()
+                awaitingDialog = true
+                logAct('Order slot already taken, scanning next queue index...')
+            else
+                pendingAccept = nil
+                resetCatchCycle('dialog error cancel')
+            end
         else
+            pendingDialogReply     = nil
             hasActiveOrder         = true
             orderConfirmedByServer = true
             pendingAccept          = nil
@@ -1616,6 +2239,14 @@ local function DrawVectorIcon(DL, kind, cx, cy, sz, col)
         DL:AddCircleFilled(imgui.ImVec2(cx - sz * 0.24, cy + sz * 0.30), sz * 0.11, u32)
         DL:AddCircleFilled(imgui.ImVec2(cx + sz * 0.24, cy + sz * 0.30), sz * 0.11, u32)
 
+    elseif kind == 'roadworker' then
+        -- Дорожный конус с полосами
+        DL:AddTriangleFilled(
+            imgui.ImVec2(cx, cy - sz * 0.42),
+            imgui.ImVec2(cx - sz * 0.28, cy + sz * 0.30),
+            imgui.ImVec2(cx + sz * 0.28, cy + sz * 0.30), u32)
+        DL:AddRectFilled(imgui.ImVec2(cx - sz * 0.38, cy + sz * 0.28), imgui.ImVec2(cx + sz * 0.38, cy + sz * 0.40), u32, SC(2))
+
     elseif kind == 'trucker' then
         DL:AddRectFilled(imgui.ImVec2(cx - sz * 0.45, cy - sz * 0.26), imgui.ImVec2(cx + sz * 0.12, cy + sz * 0.24), u32, SC(2))
         DL:AddRectFilled(imgui.ImVec2(cx + sz * 0.15, cy - sz * 0.14), imgui.ImVec2(cx + sz * 0.45, cy + sz * 0.24), u32, SC(2))
@@ -1720,7 +2351,7 @@ local function DrawHeaderLogo(DL, x, y, a)
     DL:AddText(imgui.ImVec2(tx, y + SC(4) + s1.y), CA(THEME.accentBright, a), 'JOB')
     local jw = imgui.CalcTextSize('JOB').x
     DL:AddText(imgui.ImVec2(tx + jw + SC(6), y + SC(4) + s1.y),
-        CA(THEME.dim, 0.75 * a), 'v' .. LOCAL_VERSION)
+        CA(THEME.dim, 0.75 * a), fmtVer(LOCAL_VERSION))
     if FONT_SUB then imgui.PopFont() end
 end
 
@@ -1790,6 +2421,10 @@ local function HomeTabFrame()
             saveCfg()
             notify(CFG.catchEnabled and L'Автоловля включена' or L'Автоловля выключена',
                 CFG.catchEnabled and 0x00FF00 or 0xFFAA00)
+            if CFG.catchEnabled and not JOB_STATE.firstCatchWarnShown then
+                JOB_STATE.firstCatchWarnShown = true
+                sampAddChatMessage('{00CCB3}[HfJ] {FFAA00}' .. L'Важно: 1-й заказ за сессию может отмениться с ошибкой, дальше ловит стабильно.', -1)
+            end
         end
 
         local targetAnim = CFG.catchEnabled and 1.0 or 0.0
@@ -1862,8 +2497,8 @@ local function HomeTabFrame()
 
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
         local stateLine = CFG.catchEnabled
-            and u8(L'ВКЛЮЧЕНА  •  Нажмите, чтобы остановить')
-            or  u8(L'ВЫКЛЮЧЕНА  •  Нажмите, чтобы запустить')
+            and u8(L'ВКЛЮЧЕНА  |  Нажмите, чтобы остановить')
+            or  u8(L'ВЫКЛЮЧЕНА  |  Нажмите, чтобы запустить')
         local stateLineCol = LerpVec4(THEME.dim, imgui.ImVec4(0.55, 0.96, 0.76, 1.0), on)
         DL:AddText(imgui.ImVec2(tx, p.y + SC(58)), CA(stateLineCol, a), stateLine)
 
@@ -1948,8 +2583,8 @@ local function HomeTabFrame()
     end
 
     local acceptSub = CFG.turboCatch
-        and u8(L'Подтверждает диалог мгновенно (0 мс — активен Турбо)')
-        or  u8(L'Автоматически подтверждает заказ (пауза 40-90 мс)')
+        and u8(L'Подтверждает диалог мгновенно (0 мс - активен Турбо)')
+        or  u8(L'Плавающая маскировка под игрока (реакция 30-60, приём 35-70 мс)')
     if DrawSwitchCard('accept', 'check', u8(L'Авто-принять заказ'), acceptSub, CFG.autoAccept, THEME.accent) then
         CFG.autoAccept = not CFG.autoAccept
         markDirty()
@@ -1957,7 +2592,7 @@ local function HomeTabFrame()
     imgui.Dummy(imgui.ImVec2(0, SC(8)))
 
     if DrawSwitchCard('turbo', 'bolt', u8(L'Турбо-режим (0 мс)'),
-        u8(L'Отключает анти-бот задержки для максимальной скорости'), CFG.turboCatch, THEME.warn) then
+        u8(L'Отключает человеческие задержки для максимальной скорости'), CFG.turboCatch, THEME.warn) then
         CFG.turboCatch = not CFG.turboCatch
         markDirty()
         if CFG.turboCatch then
@@ -1982,7 +2617,7 @@ local function HomeTabFrame()
         imgui.Dummy(imgui.ImVec2(0, SC(8)))
     end
 
-    -- 3) Нижний блок: Сводка заказов + отдельная чёткая кнопка "Сбросить заказ"
+    -- 3) Нижний блок: Сводка заработка и текущей смены + кнопка "Сбросить заказ"
     do
         local rowH = SC(66)
         local gap  = SC(12)
@@ -1993,14 +2628,16 @@ local function HomeTabFrame()
         -- Левая карточка: быстрая сводка
         DrawNeuBox(DL, p.x, p.y, p.x + leftW, p.y + rowH, SC(14), THEME.card, a)
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        DL:AddText(imgui.ImVec2(p.x + SC(16), p.y + SC(13)), CA(THEME.dim, a), u8(L'Выполнено заказов'))
-        DL:AddText(imgui.ImVec2(p.x + SC(16), p.y + SC(37)), CA(THEME.dim, a), u8(L'Оплата такси (чат)'))
+        local jobName = JOB_STATE.activeJob and ZP_LABEL[JOB_STATE.activeJob] or L'Вне смены'
+        DL:AddText(imgui.ImVec2(p.x + SC(16), p.y + SC(13)), CA(THEME.dim, a), u8(L'Смена: ') .. u8(jobName))
+        DL:AddText(imgui.ImVec2(p.x + SC(16), p.y + SC(37)), CA(THEME.dim, a), u8(L'Всего по работам'))
 
-        local ordVal = tostring(CFG.ordersDone)
+        local ordVal = u8(L'Заказов: ') .. tostring(CFG.ordersDone)
         local ovs = imgui.CalcTextSize(ordVal)
-        DL:AddText(imgui.ImVec2(p.x + leftW - ovs.x - SC(16), p.y + SC(13)), CA(THEME.accentBright, a), ordVal)
+        DL:AddText(imgui.ImVec2(p.x + leftW - ovs.x - SC(16), p.y + SC(13)),
+            CA(JOB_STATE.activeJob and THEME.emerald or THEME.accentBright, a), ordVal)
 
-        local mVal = '$' .. zpFormatMoney(CFG.moneyEarned)
+        local mVal = '$' .. zpFormatMoney(zpTotal())
         local mvs = imgui.CalcTextSize(mVal)
         DL:AddText(imgui.ImVec2(p.x + leftW - mvs.x - SC(16), p.y + SC(37)), CA(THEME.text, a), mVal)
         if FONT_SUB then imgui.PopFont() end
@@ -2037,11 +2674,28 @@ local function HomeTabFrame()
         DL:AddText(imgui.ImVec2(startX + SC(26), p.y + (rowH - bts.y) / 2), CA(btnCol, a), btnTxt)
     end
 
+    imgui.Dummy(imgui.ImVec2(0, SC(8)))
+    do
+        local noteH = SC(52)
+        local p = imgui.GetCursorScreenPos()
+        DrawNeuBox(DL, p.x, p.y, p.x + w, p.y + noteH, SC(12), THEME.cardDark, a,
+            imgui.ImVec4(THEME.warn.x, THEME.warn.y, THEME.warn.z, 0.30))
+        DrawVectorIcon(DL, 'info', p.x + SC(22), p.y + noteH / 2, SC(16),
+            imgui.ImVec4(THEME.warn.x, THEME.warn.y, THEME.warn.z, a))
+        if FONT_SUB then imgui.PushFont(FONT_SUB) end
+        DL:AddText(imgui.ImVec2(p.x + SC(40), p.y + SC(9)), CA(THEME.warn, 0.95 * a),
+            u8(L'Примечание (1-й заказ за сессию):'))
+        DL:AddText(imgui.ImVec2(p.x + SC(40), p.y + SC(28)), CA(THEME.dim, a),
+            u8(L'Первый заказ может отмениться с ошибкой, далее ловит стабильно.'))
+        if FONT_SUB then imgui.PopFont() end
+        imgui.Dummy(imgui.ImVec2(w, noteH))
+    end
+
     imgui.Dummy(imgui.ImVec2(0, SC(10)))
 end
 
 -- ============================================================
---  ВКЛАДКА 2: СТАТИСТИКА (КРУПНЫЙ ИТОГ + ПРОГРЕСС-БАРЫ + СБРОС ВНИЗУ)
+--  ВКЛАДКА 2: СТАТИСТИКА (ВСЕ РАБОТЫ БЕЗ PAYDAY/ЧАЕВЫХ)
 -- ============================================================
 local function StatsTabFrame()
     local a     = imgui.GetStyle().Alpha
@@ -2051,16 +2705,16 @@ local function StatsTabFrame()
 
     if not statInit then
         statDispOrders = CFG.ordersDone
-        statDispMoney  = CFG.moneyEarned
+        statDispMoney  = ZP.taxi
         statDispTotal  = totalZp
         statInit = true
     end
     statDispOrders = statDispOrders + (CFG.ordersDone - statDispOrders) * 0.16
-    statDispMoney  = statDispMoney  + (CFG.moneyEarned - statDispMoney)  * 0.16
-    statDispTotal  = statDispTotal  + (totalZp - statDispTotal)          * 0.16
+    statDispMoney  = statDispMoney  + (ZP.taxi - statDispMoney)         * 0.16
+    statDispTotal  = statDispTotal  + (totalZp - statDispTotal)         * 0.16
     if math.abs(statDispOrders - CFG.ordersDone) < 0.01 then statDispOrders = CFG.ordersDone end
-    if math.abs(statDispMoney  - CFG.moneyEarned) < 0.5 then statDispMoney  = CFG.moneyEarned end
-    if math.abs(statDispTotal  - totalZp) < 0.5 then statDispTotal = totalZp end
+    if math.abs(statDispMoney  - ZP.taxi) < 0.5         then statDispMoney  = ZP.taxi end
+    if math.abs(statDispTotal  - totalZp) < 0.5         then statDispTotal  = totalZp end
 
     -- 1) Крупная цифра заработанного
     do
@@ -2071,7 +2725,6 @@ local function StatsTabFrame()
         DrawNeuBox(DL, p.x, p.y, p.x + w, p.y + cardH, SC(16), THEME.card, a,
             imgui.ImVec4(THEME.accent.x, THEME.accent.y, THEME.accent.z, 0.25))
 
-        -- Левая половина: крупная цифра заработка по работам
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
         DL:AddText(imgui.ImVec2(p.x + SC(20), p.y + SC(16)), CA(THEME.dim, a), u8(L'Заработано по работам'))
         if FONT_SUB then imgui.PopFont() end
@@ -2081,23 +2734,26 @@ local function StatsTabFrame()
             '$' .. zpFormatMoney(statDispTotal + 0.5))
         if FONT_HERO or FONT_BIG then imgui.PopFont() end
 
-        -- Правая сторона: заказы и оплата такси
         local rx = p.x + w - SC(18)
         if FONT_SUB then imgui.PushFont(FONT_SUB) end
-        local tOrd = u8(L'Заказов: ') .. tostring(math.floor(statDispOrders + 0.5))
+        local tOrd = u8(L'Заказов такси: ') .. tostring(math.floor(statDispOrders + 0.5))
         local ots = imgui.CalcTextSize(tOrd)
         DL:AddText(imgui.ImVec2(rx - ots.x, p.y + SC(26)), CA(THEME.text, a), tOrd)
 
-        local tTax = u8(L'Такси (чат): $') .. zpFormatMoney(statDispMoney + 0.5)
+        local modeLbl = (CFG.useLogTracker and NEOM.found)
+            and (L'Учёт: NeomLog (' .. (JOB_STATE.activeJob and ZP_LABEL[JOB_STATE.activeJob] or L'ожидание') .. ')')
+            or  L'Учёт: Чат (fallback)'
+        local tTax = u8(modeLbl)
         local tts = imgui.CalcTextSize(tTax)
-        DL:AddText(imgui.ImVec2(rx - tts.x, p.y + SC(56)), CA(THEME.dim, a), tTax)
+        DL:AddText(imgui.ImVec2(rx - tts.x, p.y + SC(56)),
+            CA((CFG.useLogTracker and NEOM.found) and THEME.emerald or THEME.dim, a), tTax)
         if FONT_SUB then imgui.PopFont() end
 
         imgui.Dummy(imgui.ImVec2(w, cardH))
         imgui.Dummy(imgui.ImVec2(0, SC(12)))
     end
 
-    -- 2) Крупный заработок по каждой профессии (без прогресс-баров и процентов)
+    -- 2) Крупный заработок по каждой профессии
     do
         local rowH = SC(58)
         for i, job in ipairs(ZP_JOB_LIST) do
@@ -2107,7 +2763,6 @@ local function StatsTabFrame()
 
             DrawNeuBox(DL, p.x, p.y, p.x + w, p.y + rowH, SC(14), THEME.card, a)
 
-            -- Иконка профессии в круглом неоморфном значке
             local iconCol = val > 0 and THEME.accentBright or THEME.dim
             local icx, icy = p.x + SC(30), p.y + rowH / 2
             DL:AddCircleFilled(imgui.ImVec2(icx, icy), SC(16),
@@ -2115,13 +2770,11 @@ local function StatsTabFrame()
             DrawVectorIcon(DL, job.icon, icx, icy, SC(18),
                 imgui.ImVec4(iconCol.x, iconCol.y, iconCol.z, a))
 
-            -- Название работы слева
             local nameTxt = u8(job.label)
             local nts = imgui.CalcTextSize(nameTxt)
             DL:AddText(imgui.ImVec2(p.x + SC(58), p.y + (rowH - nts.y) / 2),
                 CA(THEME.text, a), nameTxt)
 
-            -- Крупная цифра заработка справа
             local valTxt = '$' .. zpFormatMoney(val)
             if FONT_BIG then imgui.PushFont(FONT_BIG) end
             local vts = imgui.CalcTextSize(valTxt)
@@ -2134,7 +2787,7 @@ local function StatsTabFrame()
         end
     end
 
-    -- 3) Кнопка сброса статистики спрятана в самый низ (с защитным подтверждением)
+    -- 3) Сброс статистики внизу (с защитным подтверждением)
     imgui.Dummy(imgui.ImVec2(0, SC(24)))
     do
         local now = os.clock()
@@ -2154,7 +2807,8 @@ local function StatsTabFrame()
         imgui.InvisibleButton('##hfj_reset_zp', imgui.ImVec2(halfW, SC(44)))
         if imgui.IsItemClicked() then
             if resetConfirmZp > 0 then
-                ZP.taxi, ZP.trucker, ZP.collector, ZP.deliverer, ZP.mechanic, ZP.bus, ZP.garbage = 0, 0, 0, 0, 0, 0, 0
+                ZP.taxi, ZP.roadworker, ZP.trucker, ZP.collector = 0, 0, 0, 0
+                ZP.deliverer, ZP.mechanic, ZP.bus, ZP.garbage    = 0, 0, 0, 0
                 statDispTotal = 0
                 resetConfirmZp = 0
                 markDirty(); saveCfg()
@@ -2210,9 +2864,9 @@ local function SettingsTabFrame()
     local avail = imgui.GetContentRegionAvail()
     local w     = math.max(SC(220), avail.x)
 
-    -- 1) БЛОК 1 (ОСНОВНОЙ): Профиль скрипта, установленная версия и обновления
+    -- 1) БЛОК 1 (ОСНОВНОЙ): Профиль скрипта, автор, версия и обновления
     do
-        local cardH = SC(156)
+        local cardH = SC(168)
         local p = imgui.GetCursorScreenPos()
         local DL = imgui.GetWindowDrawList()
         local updPulse = updateAvailable and (0.55 + 0.45 * math.sin(os.clock() * 3.5)) or 0.35
@@ -2231,10 +2885,17 @@ local function SettingsTabFrame()
             imgui.ImVec2(p.x + w - SC(18), p.y + SC(4)),
             C(imgui.ImVec4(borderCol.x, borderCol.y, borderCol.z, (updateAvailable and 0.95 or 0.75) * a)), SC(2))
 
-        -- Заголовок скрипта слева
+        -- Заголовок скрипта слева + автор
         if FONT_BIG then imgui.PushFont(FONT_BIG) end
-        DL:AddText(imgui.ImVec2(p.x + SC(20), p.y + SC(18)), CA(THEME.text, a), 'Help for Job (HfJ)')
+        DL:AddText(imgui.ImVec2(p.x + SC(20), p.y + SC(15)), CA(THEME.text, a), 'Help for Job (HfJ)')
         if FONT_BIG then imgui.PopFont() end
+
+        if FONT_SUB then imgui.PushFont(FONT_SUB) end
+        local authLbl = u8(L'Автор скрипта: ')
+        local als = imgui.CalcTextSize(authLbl)
+        DL:AddText(imgui.ImVec2(p.x + SC(20), p.y + SC(43)), CA(THEME.dim, a), authLbl)
+        DL:AddText(imgui.ImVec2(p.x + SC(20) + als.x, p.y + SC(43)), CA(THEME.accentBright, a), 'mugruk')
+        if FONT_SUB then imgui.PopFont() end
 
         -- Выделенный бейдж справа вверху (при наличии обновления подсвечивается новая версия)
         local verBadge = updateAvailable
@@ -2260,10 +2921,10 @@ local function SettingsTabFrame()
             and (u8(L'Установлена ') .. fmtVer(LOCAL_VERSION) .. u8(L'  |  Требуется обновление!'))
             or  (u8(L'Статус обновлений: ') .. u8(updaterStatus))
         local statusCol = updateAvailable and THEME.emerald or THEME.dim
-        DL:AddText(imgui.ImVec2(p.x + SC(20), p.y + SC(54)), CA(statusCol, a), statusTxt)
+        DL:AddText(imgui.ImVec2(p.x + SC(20), p.y + SC(66)), CA(statusCol, a), statusTxt)
 
         -- Главная кнопка проверки / установки обновления
-        imgui.SetCursorScreenPos(imgui.ImVec2(p.x + SC(18), p.y + SC(90)))
+        imgui.SetCursorScreenPos(imgui.ImVec2(p.x + SC(18), p.y + SC(102)))
         imgui.PushItemWidth(w - SC(36))
         local btnW = w - SC(36)
         local btnH = SC(48)
@@ -2306,7 +2967,57 @@ local function SettingsTabFrame()
         imgui.Dummy(imgui.ImVec2(w, SC(14)))
     end
 
-    -- 2) БЛОК 2: Инструкция по работе, команды и безопасность (увеличенный шрифт)
+    -- 2) БЛОК 2: Учёт заработка по работам (NeomLog Packet 220, без PayDay и чаевых)
+    do
+        local cardH = SC(140)
+        local p = imgui.GetCursorScreenPos()
+        local DL = imgui.GetWindowDrawList()
+        DrawNeuBox(DL, p.x, p.y, p.x + w, p.y + cardH, SC(16), THEME.card, a)
+
+        if FONT_BIG then imgui.PushFont(FONT_BIG) end
+        DL:AddText(imgui.ImVec2(p.x + SC(20), p.y + SC(14)), CA(THEME.accentBright, a), u8(L'Источник учёта ЗП'))
+        if FONT_BIG then imgui.PopFont() end
+
+        local logStatusTxt = not CFG.useLogTracker and u8(L'Режим: Только чат')
+            or (NEOM.found
+                and (u8(L'NeomLog: подключён  |  HUD: $') .. (NEOM.lastHudBalance and zpFormatMoney(NEOM.lastHudBalance) or '...'))
+                or  u8(L'NeomLog: файл не найден (работает чат)'))
+        local logStatusCol = (CFG.useLogTracker and NEOM.found) and THEME.emerald or THEME.dim
+        DL:AddText(imgui.ImVec2(p.x + SC(20), p.y + SC(46)), CA(logStatusCol, a), logStatusTxt)
+
+        -- Одна широкая кнопка переключения режима NeomLog
+        local btnY = p.y + SC(80)
+        local btnH = SC(44)
+        local bx1  = p.x + SC(18)
+        local bw   = w - SC(36)
+
+        imgui.SetCursorScreenPos(imgui.ImVec2(bx1, btnY))
+        imgui.InvisibleButton('##hfj_toggle_neomlog', imgui.ImVec2(bw, btnH))
+        if imgui.IsItemClicked() then
+            CFG.useLogTracker = not CFG.useLogTracker
+            markDirty(); saveCfg()
+            if CFG.useLogTracker then initNeomTailer() end
+            notify(CFG.useLogTracker and L'Учёт через NeomLog включён' or L'Режим: только чат',
+                CFG.useLogTracker and 0x00FF00 or 0xFFAA00)
+        end
+        local hovL = imgui.IsItemHovered()
+        DrawNeuBox(DL, bx1, btnY, bx1 + bw, btnY + btnH, SC(12),
+            hovL and THEME.tileHover or THEME.cardDark, a,
+            CFG.useLogTracker and THEME.emerald or nil)
+        if FONT_SUB then imgui.PushFont(FONT_SUB) end
+        local l1 = CFG.useLogTracker
+            and u8(L'NeomLog (Packet 220): ВКЛ  |  PayDay и чаевые отключены')
+            or  u8(L'NeomLog (Packet 220): ВЫКЛ (только чат)')
+        local s1 = imgui.CalcTextSize(l1)
+        DL:AddText(imgui.ImVec2(bx1 + (bw - s1.x) / 2, btnY + (btnH - s1.y) / 2),
+            CA(CFG.useLogTracker and THEME.emerald or THEME.dim, a), l1)
+        if FONT_SUB then imgui.PopFont() end
+
+        imgui.SetCursorScreenPos(imgui.ImVec2(p.x, p.y + cardH))
+        imgui.Dummy(imgui.ImVec2(w, SC(14)))
+    end
+
+    -- 3) БЛОК 3: Инструкция по работе, команды и безопасность (увеличенный шрифт)
     do
         local cmds = {
             { '/hfj',       L'открыть / закрыть меню' },
@@ -2314,11 +3025,11 @@ local function SettingsTabFrame()
             { '/resetstat', L'сброс всей статистики' },
             { '/checkupd',  L'проверить обновления' },
             { '/update',    L'скачать обновление' },
-            { '/updinfo',   L'диагностика апдейтера' },
+            { '/updinfo',   L'диагностика апдейтера и лога' },
             { '/takecargo', L'взять заказ (клавиша 2)' },
         }
         local rowH   = SC(32)
-        local infoH  = SC(72)
+        local infoH  = SC(100)
         local topPad = SC(54)
         local cardH  = topPad + infoH + SC(16) + #cmds * rowH + SC(16)
         local p = imgui.GetCursorScreenPos()
@@ -2341,12 +3052,16 @@ local function SettingsTabFrame()
             u8(L'Телефон и оплата (:CASH:) защищены'))
 
         local modeLine = CFG.turboCatch
-            and u8(L'Режим: Турбо (0 мс)  •  Обычный: 50-70 / 40-90 мс')
-            or  u8(L'Режим: Обычный (50-70 мс / 40-90 мс)  •  Турбо: 0 мс')
+            and u8(L'Режим: Турбо (0 мс)  |  Обычный: живые задержки 30-70 мс')
+            or  u8(L'Режим: Живые задержки (30-60 / 35-70 мс)  |  Турбо: 0 мс')
         DL:AddCircleFilled(imgui.ImVec2(ix1 + SC(16), iy1 + SC(50)), SC(4),
             CA(CFG.turboCatch and THEME.warn or THEME.accentBright, a), 14)
         DL:AddText(imgui.ImVec2(ix1 + SC(28), iy1 + SC(39)),
             CA(CFG.turboCatch and THEME.warn or THEME.dim, a), modeLine)
+
+        DL:AddCircleFilled(imgui.ImVec2(ix1 + SC(16), iy1 + SC(79)), SC(4), CA(THEME.warn, a), 14)
+        DL:AddText(imgui.ImVec2(ix1 + SC(28), iy1 + SC(68)), CA(THEME.warn, 0.92 * a),
+            u8(L'1-й заказ за сессию может отмениться с ошибкой (норма)'))
 
         -- Список команд крупным читаемым шрифтом (19px)
         local listTop = iy2 + SC(16)
@@ -2519,7 +3234,7 @@ local function DashboardWindow(var)
         end
 
         -- Центральный экран (Контент)
-        local padX = SC(18)
+        local padX = SC(14)
         local padY = SC(12)
         local contentW = math.max(SC(120), wsize.x - padX * 2)
         local contentH = math.max(SC(120), wsize.y - headerH - bottomH - padY * 2)
@@ -2675,9 +3390,8 @@ imgui.OnInitialize(function()
     end
     if def then imio.FontDefault = def end
 
-    FONT_LOGO = loadFont(bold_paths, SC(24)) or def
     FONT_SUB  = loadFont(regular_paths, SC(15)) or def
-    FONT_BIG  = loadFont(bold_paths, SC(22)) or FONT_LOGO
+    FONT_BIG  = loadFont(bold_paths, SC(22)) or def
     FONT_HERO = loadFont(bold_paths, SC(36)) or FONT_BIG
 
     local style = imgui.GetStyle()
@@ -2686,12 +3400,13 @@ imgui.OnInitialize(function()
     style.ChildRounding     = SC(16)
     style.FrameRounding     = SC(14)
     style.PopupRounding     = SC(14)
-    style.ScrollbarRounding = SC(12)
+    style.ScrollbarRounding = SC(14)
     style.GrabRounding      = SC(12)
+    style.GrabMinSize       = SC(34)
     style.ItemSpacing       = imgui.ImVec2(SC(10), SC(10))
     style.ItemInnerSpacing  = imgui.ImVec2(SC(8), SC(8))
     style.FramePadding      = imgui.ImVec2(SC(10), SC(8))
-    style.ScrollbarSize     = SC(8)
+    style.ScrollbarSize     = SC(24)
     style.WindowBorderSize  = 0
 
     local col = style.Colors
@@ -2711,8 +3426,8 @@ imgui.OnInitialize(function()
     col[imgui.Col.SliderGrab]       = THEME.accent
     col[imgui.Col.SliderGrabActive] = THEME.accentBright
     col[imgui.Col.CheckMark]        = THEME.accent
-    col[imgui.Col.ScrollbarBg]      = imgui.ImVec4(0.07, 0.08, 0.10, 1.0)
-    col[imgui.Col.ScrollbarGrab]    = imgui.ImVec4(0.20, 0.23, 0.28, 1.0)
+    col[imgui.Col.ScrollbarBg]      = imgui.ImVec4(0.075, 0.084, 0.102, 1.0)
+    col[imgui.Col.ScrollbarGrab]    = imgui.ImVec4(0.28, 0.34, 0.42, 1.0)
     col[imgui.Col.ScrollbarGrabHovered] = THEME.accentDark
     col[imgui.Col.ScrollbarGrabActive]  = THEME.accent
 end)
@@ -2721,7 +3436,7 @@ end)
 --  РЕНДЕР ОКНА
 -- ============================================================
 imgui.OnFrame(
-    function() return (not BLOCK.blocked) and (window[0] or windowAlpha > 0.005) and isSampAvailable() and not isPauseMenuActive() end,
+    function() return (window[0] or windowAlpha > 0.005) and isSampAvailable() and not isPauseMenuActive() end,
     function(this)
         this.ShowCursor = (window[0] or windowAlpha > 0.35)
         local target = window[0] and 1.0 or 0.0
@@ -3021,26 +3736,35 @@ imgui.OnFrame(
             sn.dur     = (#sn.queue > 0) and 1.2 or NOTIFY_DURATION
             sn.state   = 'showing'
             sn.version = sn.version + 1
-            sn.anim    = 0
             acquireNotifyLock(sn.dur)
-            local myv = sn.version
-
-            bringFloatTo(0, 1, sn.timer, NOTIFY_ANIM_IN, 'outQuart', function(f)
-                if sn.version == myv then sn.anim = f end
-            end)
+            startToastAnim(0, 1, NOTIFY_ANIM_IN, 'outQuart')
         elseif sn.state == 'showing' then
             local effDur = (#sn.queue > 0) and math.min(sn.dur, 1.1) or sn.dur
             if (os.clock() - sn.timer) >= effDur then
                 sn.state = 'hiding'
                 sn.timer = os.clock()
-                local myv = sn.version
-                bringFloatTo(1, 0, sn.timer, NOTIFY_ANIM_OUT, 'inBack', function(f)
-                    if sn.version == myv then
-                        sn.anim = f
-                        if f <= 0.02 then sn.state = 'idle' end
-                    end
-                end)
+                startToastAnim(sn.anim, 0, NOTIFY_ANIM_OUT, 'inBack')
             end
+        end
+
+        if sn.state == 'idle' then return end
+
+        -- Плавная анимация тоста без создания лишних lua_thread корутин
+        if sn.animDur > 0 then
+            local elapsed = os.clock() - sn.animStart
+            if elapsed >= sn.animDur then
+                sn.anim = sn.animTo
+                sn.animDur = 0
+                if sn.state == 'hiding' and sn.anim <= 0.02 then
+                    sn.state = 'idle'
+                end
+            else
+                local ef = Easing[sn.animEase] or function(x) return x end
+                local progress = math.max(0, math.min(1, elapsed / sn.animDur))
+                sn.anim = sn.animFrom + (sn.animTo - sn.animFrom) * ef(progress)
+            end
+        elseif sn.state == 'hiding' and sn.anim <= 0.02 then
+            sn.state = 'idle'
         end
 
         if sn.state == 'idle' then return end
@@ -3137,235 +3861,10 @@ imgui.OnFrame(
 )
 
 -- ============================================================
---  ПРИНУДИТЕЛЬНОЕ ОКНО БЛОКИРОВКИ УСТАРЕВШЕЙ ВЕРСИИ
+--  MAIN & ХЕЛПЕРЫ ЦИКЛА (РАЗГРУЗКА UPVALUES ДЛЯ LUAJIT)
 -- ============================================================
-imgui.OnFrame(
-    function() return BLOCK.blocked and (BLOCK.modal[0] or BLOCK.modalAlpha > 0.005) and isSampAvailable() and not isPauseMenuActive() end,
-    function(this)
-        this.ShowCursor = (BLOCK.modal[0] or BLOCK.modalAlpha > 0.35)
-        local target = BLOCK.modal[0] and 1.0 or 0.0
-        BLOCK.modalAlpha = BLOCK.modalAlpha + (target - BLOCK.modalAlpha) * 0.28
-        if math.abs(target - BLOCK.modalAlpha) < 0.01 then BLOCK.modalAlpha = target end
-
-        if BLOCK.modalAlpha <= 0.005 and not BLOCK.modal[0] then
-            BLOCK.modalAlpha = 0
-            return
-        end
-
-        local sw, sh = getScreenResolution()
-        if not sw or sw <= 0 then sw, sh = 1280, 720 end
-
-        local mw = math.min(SC(460), sw - SC(32))
-        local mh = SC(300)
-        local a  = BLOCK.modalAlpha
-
-        imgui.SetNextWindowPos(imgui.ImVec2(sw / 2, sh / 2), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
-        imgui.SetNextWindowSize(imgui.ImVec2(mw, mh), imgui.Cond.Always)
-        imgui.PushStyleVarFloat(imgui.StyleVar.Alpha, math.max(0.01, a))
-
-        local visible = imgui.Begin('##HfJBlockedModal', nil,
-            imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoBackground
-            + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoResize
-            + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoCollapse)
-
-        if visible then
-            local pos = imgui.GetWindowPos()
-            local DL  = imgui.GetWindowDrawList()
-            local R   = SC(18)
-
-            DL:AddRectFilled(
-                imgui.ImVec2(pos.x + SC(5), pos.y + SC(7)),
-                imgui.ImVec2(pos.x + mw + SC(7), pos.y + mh + SC(10)),
-                CA(THEME.shadowDark, 0.88 * a), R + SC(4))
-            DL:AddRectFilled(pos, imgui.ImVec2(pos.x + mw, pos.y + mh), CA(THEME.bg, a), R)
-            DL:AddRect(pos, imgui.ImVec2(pos.x + mw, pos.y + mh),
-                C(imgui.ImVec4(THEME.danger.x, THEME.danger.y, THEME.danger.z, 0.65 * a)), R, 0, SC(1.5))
-
-            -- Тревожная верхняя полоска
-            DL:AddRectFilled(
-                imgui.ImVec2(pos.x + SC(20), pos.y + SC(1)),
-                imgui.ImVec2(pos.x + mw - SC(20), pos.y + SC(4)),
-                CA(THEME.danger, a), SC(2))
-
-            -- Шапка окна блокировки + крестик закрытия
-            local bx, by = pos.x + SC(20), pos.y + SC(18)
-            DL:AddRectFilled(imgui.ImVec2(bx, by), imgui.ImVec2(bx + SC(36), by + SC(36)),
-                C(imgui.ImVec4(THEME.danger.x, THEME.danger.y, THEME.danger.z, 0.22 * a)), SC(10))
-            DrawVectorIcon(DL, 'warn', bx + SC(18), by + SC(18), SC(20),
-                imgui.ImVec4(THEME.danger.x, THEME.danger.y, THEME.danger.z, a))
-            if FONT_BIG then imgui.PushFont(FONT_BIG) end
-            DL:AddText(imgui.ImVec2(bx + SC(48), by + SC(6)), CA(THEME.text, a),
-                updateDownloading and u8(L'Обновление скрипта') or u8(L'Версия заблокирована'))
-            if FONT_BIG then imgui.PopFont() end
-
-            -- Крестик в правом верхнем углу (временно закрывает окно)
-            local closeSz = SC(30)
-            local closeX  = pos.x + mw - closeSz - SC(16)
-            local closeY  = by + SC(3)
-            imgui.SetCursorScreenPos(imgui.ImVec2(closeX, closeY))
-            imgui.InvisibleButton('##hfj_blk_close_x', imgui.ImVec2(closeSz, closeSz))
-            local clkX = imgui.IsItemClicked()
-            local hovX = imgui.IsItemHovered()
-            local ccx, ccy = closeX + closeSz / 2, closeY + closeSz / 2
-            DL:AddCircleFilled(imgui.ImVec2(ccx, ccy), closeSz / 2,
-                CA(hovX and THEME.danger or THEME.card, a), 24)
-            local d = SC(5)
-            local xu32 = hovX and C(imgui.ImVec4(1, 1, 1, a)) or CA(THEME.dim, a)
-            DL:AddLine(imgui.ImVec2(ccx - d, ccy - d), imgui.ImVec2(ccx + d, ccy + d), xu32, SC(1.8))
-            DL:AddLine(imgui.ImVec2(ccx - d, ccy + d), imgui.ImVec2(ccx + d, ccy - d), xu32, SC(1.8))
-
-            -- Внутренняя карточка
-            local cx1, cy1 = pos.x + SC(20), pos.y + SC(68)
-            local cx2, cy2 = pos.x + mw - SC(20), pos.y + SC(216)
-            DrawNeuBox(DL, cx1, cy1, cx2, cy2, SC(14), THEME.card, a)
-
-            local verCur = u8(L'Текущая: ') .. fmtVer(LOCAL_VERSION)
-            local verNew = remoteVersion ~= '' and (u8(L'Доступна: ') .. u8(fmtVer(remoteVersion))) or u8(L'Требуется обнова')
-            DL:AddText(imgui.ImVec2(cx1 + SC(16), cy1 + SC(15)), CA(THEME.danger, a), verCur)
-            if FONT_BIG then imgui.PushFont(FONT_BIG) end
-            local vns = imgui.CalcTextSize(verNew)
-            DL:AddText(imgui.ImVec2(cx2 - vns.x - SC(16), cy1 + SC(13)),
-                CA(remoteVersion ~= '' and THEME.emerald or THEME.warn, a), verNew)
-            if FONT_BIG then imgui.PopFont() end
-
-            DL:AddLine(
-                imgui.ImVec2(cx1 + SC(16), cy1 + SC(46)),
-                imgui.ImVec2(cx2 - SC(16), cy1 + SC(46)),
-                C(imgui.ImVec4(1, 1, 1, 0.06 * a)), SC(1))
-
-            if updateDownloading then
-                updProg.disp = updProg.disp + (updProg.pct - updProg.disp) * 0.22
-                if math.abs(updProg.pct - updProg.disp) < 0.004 then updProg.disp = updProg.pct end
-                local pctVal = math.max(0, math.min(100, math.floor(updProg.disp * 100 + 0.5)))
-
-                DrawVectorIcon(DL, 'spinner', cx1 + SC(26), cy1 + SC(69), SC(18),
-                    imgui.ImVec4(THEME.emerald.x, THEME.emerald.y, THEME.emerald.z, a))
-                DL:AddText(imgui.ImVec2(cx1 + SC(44), cy1 + SC(59)), CA(THEME.text, a), u8(updProg.stage))
-
-                local pctTxt = tostring(pctVal) .. '%'
-                if FONT_BIG then imgui.PushFont(FONT_BIG) end
-                local pts = imgui.CalcTextSize(pctTxt)
-                DL:AddText(imgui.ImVec2(cx2 - pts.x - SC(16), cy1 + SC(56)), CA(THEME.emerald, a), pctTxt)
-                if FONT_BIG then imgui.PopFont() end
-
-                local barX1, barX2 = cx1 + SC(16), cx2 - SC(16)
-                local barY1, barY2 = cy1 + SC(92), cy1 + SC(106)
-                local fillW = (barX2 - barX1) * math.max(0.03, math.min(1, updProg.disp))
-                DL:AddRectFilled(imgui.ImVec2(barX1, barY1), imgui.ImVec2(barX2, barY2), CA(THEME.cardDark, a), SC(7))
-                DL:AddRectFilled(imgui.ImVec2(barX1, barY1), imgui.ImVec2(barX1 + fillW, barY2), CA(THEME.emerald, a), SC(7))
-
-                if FONT_SUB then imgui.PushFont(FONT_SUB) end
-                local kbTxt = updProg.total > 0
-                    and string.format('%.1f / %.1f %s', updProg.bytes / 1024, updProg.total / 1024, u8(L'КБ'))
-                    or  string.format('%.1f %s', updProg.bytes / 1024, u8(L'КБ загружено'))
-                DL:AddText(imgui.ImVec2(barX1, cy1 + SC(116)), CA(THEME.dim, a), kbTxt)
-                if FONT_SUB then imgui.PopFont() end
-            else
-                DL:AddText(imgui.ImVec2(cx1 + SC(16), cy1 + SC(60)), CA(THEME.text, a),
-                    u8(L'Эта версия скрипта отключена на сервере.'))
-                DL:AddText(imgui.ImVec2(cx1 + SC(16), cy1 + SC(88)), CA(THEME.dim, a),
-                    u8(L'Доступ к меню закрыт до обновления.'))
-                if FONT_SUB then imgui.PushFont(FONT_SUB) end
-                DL:AddText(imgui.ImVec2(cx1 + SC(16), cy1 + SC(116)), CA(THEME.warn, 0.9 * a),
-                    u8(L'При закрытии окно появится снова через 60 сек.'))
-                if FONT_SUB then imgui.PopFont() end
-            end
-
-            -- Нижние кнопки: Обновить и Закрыть
-            local gap = SC(12)
-            local btnW = (mw - SC(40) - gap) / 2
-            local btnH = SC(48)
-            local btnY = pos.y + mh - btnH - SC(18)
-
-            imgui.SetCursorScreenPos(imgui.ImVec2(pos.x + SC(20), btnY))
-            imgui.InvisibleButton('##hfj_blk_upd', imgui.ImVec2(btnW, btnH))
-            local clkUpd = imgui.IsItemClicked()
-            local hovUpd = imgui.IsItemHovered()
-            if clkUpd and not updateDownloading then
-                if updateAvailable then doUpdate() else doCheck(false, true) end
-            end
-            local updBg = updateDownloading
-                and THEME.tile
-                or  (hovUpd and THEME.emerald or LerpVec4(THEME.accent, THEME.emerald, 0.45))
-            DrawNeuBox(DL, pos.x + SC(20), btnY, pos.x + SC(20) + btnW, btnY + btnH, SC(12),
-                updBg, a, THEME.emerald)
-            local updLbl = updateDownloading
-                and (tostring(math.max(0, math.min(100, math.floor(updProg.disp * 100 + 0.5)))) .. '%')
-                or  u8(L'Обновить')
-            if FONT_BIG then imgui.PushFont(FONT_BIG) end
-            local uls = imgui.CalcTextSize(updLbl)
-            DL:AddText(
-                imgui.ImVec2(pos.x + SC(20) + (btnW - uls.x) / 2, btnY + (btnH - uls.y) / 2),
-                CA(updateDownloading and THEME.emerald or imgui.ImVec4(0.04, 0.08, 0.07, 1.0), a),
-                updLbl)
-            if FONT_BIG then imgui.PopFont() end
-
-            local bx2 = pos.x + SC(20) + btnW + gap
-            imgui.SetCursorScreenPos(imgui.ImVec2(bx2, btnY))
-            imgui.InvisibleButton('##hfj_blk_close', imgui.ImVec2(btnW, btnH))
-            local clkClose = imgui.IsItemClicked()
-            local hovClose = imgui.IsItemHovered()
-            if clkClose or clkX then
-                BLOCK.modal[0] = false
-                BLOCK.reopenAt = os.clock() + BLOCK.REOPEN_DELAY
-                if not updateDownloading then
-                    notify(L'Версия заблокирована. Окно вернётся через 60 сек', 0xFFAA00)
-                end
-            end
-            DrawNeuBox(DL, bx2, btnY, bx2 + btnW, btnY + btnH, SC(12),
-                hovClose and THEME.tileHover or THEME.tile, a,
-                imgui.ImVec4(1, 1, 1, 0.08))
-            local clsLbl = u8(L'Закрыть')
-            if FONT_BIG then imgui.PushFont(FONT_BIG) end
-            local cls = imgui.CalcTextSize(clsLbl)
-            DL:AddText(
-                imgui.ImVec2(bx2 + (btnW - cls.x) / 2, btnY + (btnH - cls.y) / 2),
-                CA(THEME.text, a), clsLbl)
-            if FONT_BIG then imgui.PopFont() end
-        end
-        imgui.End()
-        imgui.PopStyleVar()
-    end
-)
-
--- ============================================================
---  MAIN
--- ============================================================
-local function tickUpdateAndBlock(now)
-    if canDownload and not updateDownloading
-       and (os.time() - lastAutoCheck) >= AUTO_CHECK_EVERY then
-        lastAutoCheck = os.time()
-        checkBlockedVersions(true)
-        doCheck(true)
-    end
-
-    if BLOCK.blocked then
-        if window[0] then window[0] = false end
-        if not BLOCK.modal[0] and BLOCK.reopenAt > 0 and now >= BLOCK.reopenAt then
-            BLOCK.modal[0]   = true
-            BLOCK.modalAlpha = 0
-            logAct('Blocked version modal reopened after cooldown')
-        end
-    end
-end
-
-function main()
-    while not isSampAvailable() do wait(200) end
-
-    math.randomseed(os.time())
-
-    logInit()
-    loadCfg()
-    logAct('Script loaded. ' .. fmtVer(VERSION) .. ' (utf8_file=' .. tostring(FILE_IS_UTF8) .. ')')
-
+local function registerChatCommands()
     local function toggleMenu()
-        if BLOCK.blocked then
-            window[0]        = false
-            BLOCK.modal[0]   = true
-            BLOCK.modalAlpha = 0
-            notify(L'Эта версия заблокирована. Требуется обновление', 0xFF0000)
-            return
-        end
         if window[0] then
             window[0] = false
         else
@@ -3410,69 +3909,135 @@ function main()
         notify(L'Версия: ' .. fmtVer(LOCAL_VERSION) ..
             L' | Сервер: ' .. fmtVer(remoteVersion), 0x00CCB3)
         notify(L'Транспорты: ' .. updaterTransportsText(), 0x00CCB3)
-        notify(L'Статус: ' .. updaterStatus
-            .. (BLOCK.blocked and L' | БЛОКИРОВКА АКТИВНА' or ''), 0x00CCB3)
+        notify(L'NeomLog: ' .. (NEOM.found and (L'OK, пакетов: ' .. NEOM.packetsRead) or L'не найден')
+            .. L' | Смена: ' .. (JOB_STATE.activeJob or 'none'), 0x00CCB3)
     end)
+end
 
-    notify(L'Help for Job ' .. fmtVer(VERSION) .. L' загружен, /hfj - меню', 0x00FF00)
-    startUpdateCheck()
+local function tickBackgroundTasks(now)
+    pcall(pollNeomLog, now)
+    flushLogBuffer(false)
 
-    lua_thread.create(function()
-        while true do
-            wait(500)
-            if isSampAvailable() and type(doesCharExist) == 'function' and doesCharExist(PLAYER_PED) then
-                local ok, x, y, z = pcall(getCharCoordinates, PLAYER_PED)
-                if ok and x and y and z then
-                    if zpLastX then
-                        local dx, dy, dz = x - zpLastX, y - zpLastY, z - zpLastZ
-                        zpMovedDist = zpMovedDist + math.sqrt(dx*dx + dy*dy + dz*dz)
-                    end
-                    zpLastX, zpLastY, zpLastZ = x, y, z
+    -- Отложенный chat-fallback (если Packet 220 не поступил в neomloader.log за 1.8с)
+    if #JOB_STATE.pendingChatPayouts > 0 then
+        for i = #JOB_STATE.pendingChatPayouts, 1, -1 do
+            local item = JOB_STATE.pendingChatPayouts[i]
+            if now >= item.fireAt then
+                table.remove(JOB_STATE.pendingChatPayouts, i)
+                local hudAt = JOB_STATE.lastJobHudPayAt[item.job] or 0
+                if (now - hudAt) >= 8.0 then
+                    creditJobPayout(item.job, item.amount, 'chat-fallback', false)
+                    JOB_STATE.lastJobChatPayAt[item.job] = now
                 end
             end
         end
-    end)
+    end
+
+    -- Резервное авто-завершение заказа такси по Packet 220 (если чат не прислал строку доставки)
+    if JOB_STATE.taxiHudPayPendingAt and (now - JOB_STATE.taxiHudPayPendingAt) >= 2.0 then
+        JOB_STATE.taxiHudPayPendingAt = nil
+        if hasActiveOrder and JOB_STATE.activeJob == 'taxi' then
+            finishOrder(L'Packet220 оплата')
+        end
+    end
+
+    -- Тихая проверка обновлений раз в 30 минут
+    if canDownload and not updateDownloading
+       and (os.time() - lastAutoCheck) >= AUTO_CHECK_EVERY then
+        lastAutoCheck = os.time()
+        doCheck(true)
+    end
+
+    if cfgDirty and (now - lastAutoSave) > 1.5 then
+        lastAutoSave = now; saveCfg()
+    end
+end
+
+local function tickAutoCatch(now)
+    -- Отложенный человеческий ответ на диалог подтверждения заказа (без лишней корутины)
+    if pendingDialogReply and now >= pendingDialogReply.sendAt then
+        local rep = pendingDialogReply
+        pendingDialogReply = nil
+        if hasActiveOrder and CFG.catchEnabled
+           and JOB_STATE.activeJob == 'taxi'
+           and now >= JOB_STATE.taxiErrorBlockUntil then
+            executeDialogAcceptNow(rep.id, rep.style, rep.delayMs, rep.isTwoStepConfirm)
+        else
+            logAct('Auto-accept aborted (cancelled/changed during delay)')
+        end
+    end
+
+    if pendingAccept and (now - pendingAccept) > CATCH.PENDING_TIMEOUT then
+        logAct('Accept timeout: pendingAccept expired')
+        pendingAccept = nil
+        hasActiveOrder = false
+        acceptConfirmExpire = 0
+        resetCatchCycle('accept timeout')
+    end
+
+    -- Тайм-аут неподтверждённого авто-приёма (если сервер не прислал подтверждение или отказ)
+    if hasActiveOrder and not orderConfirmedByServer and acceptConfirmExpire > 0 and now > acceptConfirmExpire then
+        logAct('Order confirm timeout: resetting hasActiveOrder')
+        hasActiveOrder          = false
+        pendingAccept           = nil
+        acceptConfirmExpire     = 0
+        lastAcceptedDialogId    = nil
+        lastAcceptedDialogStyle = nil
+        resetCatchCycle('confirm timeout')
+    end
+
+    if awaitingDialog and now > awaitingExpire then
+        awaitingDialog = false
+        tapSequenceActive = false
+        if not hasActiveOrder and pendingAccept then
+            pendingAccept = nil
+            resetCatchCycle('awaiting timeout')
+        end
+    end
+
+    if tapSequenceActive and now >= tapSeqNextSend then
+        local maxTaps = CFG.turboCatch and CATCH.MAX_TAPS_TURBO or CATCH.MAX_TAPS_NORMAL
+        if tapSeqIndex <= maxTaps then
+            sendTapPacketWithIndex(tapSeqIndex)
+            tapSeqIndex = tapSeqIndex + 1
+
+            if tapSeqIndex > maxTaps then
+                tapSequenceActive = false
+            else
+                local currentStepMs = CFG.turboCatch and CATCH.TAP_STEP_TURBO or humanDelayMs(CATCH.TAP_STEP_MIN, CATCH.TAP_STEP_MAX)
+                tapSeqNextSend = now + currentStepMs / 1000
+            end
+        else
+            tapSequenceActive = false
+        end
+    end
+end
+
+function main()
+    while not isSampAvailable() do wait(200) end
+
+    math.randomseed(os.time())
+
+    logInit()
+    loadCfg()
+    logAct('Script loaded. ' .. fmtVer(VERSION) .. ' (utf8_file=' .. tostring(FILE_IS_UTF8) .. ')')
+
+    registerChatCommands()
+
+    pcall(initNeomTailer)
+    notify(L'Help for Job ' .. fmtVer(VERSION) .. L' загружен, /hfj - меню', 0x00FF00)
+    if CFG.catchEnabled and not JOB_STATE.firstCatchWarnShown then
+        JOB_STATE.firstCatchWarnShown = true
+        sampAddChatMessage('{00CCB3}[HfJ] {FFAA00}' .. L'Важно: 1-й заказ за сессию может отмениться с ошибкой, дальше ловит стабильно.', -1)
+    end
+    startUpdateCheck()
 
     lastAutoSave = os.clock()
 
     while true do
         wait(0)
         local now = os.clock()
-
-        tickUpdateAndBlock(now)
-
-        if cfgDirty and (now - lastAutoSave) > 1.5 then
-            lastAutoSave = now; saveCfg()
-        end
-
-        if pendingAccept and (now - pendingAccept) > PENDING_TIMEOUT then
-            logAct('Accept timeout: pendingAccept expired')
-            pendingAccept = nil
-            hasActiveOrder = false
-            resetCatchCycle('accept timeout')
-        end
-
-        if awaitingDialog and now > awaitingExpire then
-            awaitingDialog = false
-            tapSequenceActive = false
-        end
-
-        if tapSequenceActive then
-            if now >= tapSeqNextSend then
-                if tapSeqIndex <= MAX_TAPS then
-                    sendTapPacketWithIndex(tapSeqIndex)
-                    tapSeqIndex = tapSeqIndex + 1
-
-                    local randomOffset = math.random(-5, 15)
-                    local currentStepMs = math.max(10, TAP_STEP_MS + randomOffset)
-                    if CFG.turboCatch then
-                        currentStepMs = 0
-                    end
-                    tapSeqNextSend = now + currentStepMs / 1000
-                else
-                    tapSequenceActive = false
-                end
-            end
-        end
+        tickBackgroundTasks(now)
+        tickAutoCatch(now)
     end
 end
